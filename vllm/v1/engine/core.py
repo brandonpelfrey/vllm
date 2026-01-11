@@ -983,7 +983,7 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_rank_local = local_dp_rank
                 engine_core = DPEngineCoreProc(*args, tensor_queues=tensor_queues, **kwargs)
             else:
-                engine_core = EngineCoreProc(*args, tensor_queues=tensor_queues, **kwargs)
+                engine_core = EngineCoreProc(*args, engine_index=dp_rank, tensor_queues=tensor_queues, **kwargs)
 
             assert engine_core is not None
             engine_core.run_busy_loop()
