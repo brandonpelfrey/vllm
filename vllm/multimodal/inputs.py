@@ -518,7 +518,7 @@ class MultiModalBatchedField(BaseMultiModalField):
                     (len(batch), *batch[0].shape),
                     dtype=batch[0].dtype,
                     device=batch[0].device,
-                    pin_memory=pin_memory,
+                    pin_memory=pin_memory and batch[0].device.type == "cpu",
                 )
                 return torch.stack(batch, out=out)
 
