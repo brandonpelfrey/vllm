@@ -41,9 +41,7 @@ def __getattr__(name: str):
             DeprecationWarning,
             stacklevel=2,
         )
-
         return MEDIA_CONNECTOR_REGISTRY
-
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
