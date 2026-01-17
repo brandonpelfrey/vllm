@@ -29,6 +29,39 @@ class VideoDummyOptions(BaseDummyOptions):
 
 
 @dataclass(config=ConfigDict(extra="forbid"))
+class VideoProfilingConfig:
+    """Configuration for video VRAM profiling when using hardware-accelerated 
+    video decoding (e.g., PyNvVideoCodec).
+    
+    These parameters are used solely for VRAM profiling during engine 
+    initialization to accurately reserve memory for video decoding operations.
+    They do not control actual video processing at inference time.
+    """
+
+    width: int = Field(gt=0)
+    """Width of raw decoded video frames in pixels."""
+    
+    height: int = Field(gt=0)
+    """Height of raw decoded video frames in pixels."""
+    
+    frames: int = Field(gt=0)
+    """Number of frames per video for profiling."""
+    
+    proc_width: int | None = Field(None, gt=0)
+    """Width after model preprocessing. Defaults to width if not specified."""
+    
+    proc_height: int | None = Field(None, gt=0)
+    """Height after model preprocessing. Defaults to height if not specified."""
+    
+    def __post_init__(self):
+        # Set proc_width and proc_height to width and height if not specified
+        if self.proc_width is None:
+            object.__setattr__(self, 'proc_width', self.width)
+        if self.proc_height is None:
+            object.__setattr__(self, 'proc_height', self.height)
+
+
+@dataclass(config=ConfigDict(extra="forbid"))
 class ImageDummyOptions(BaseDummyOptions):
     """Options for generating dummy image data during profiling."""
 
@@ -144,6 +177,15 @@ class MultiModalConfig:
     """Maximum number of videos that can be preprocessed concurrently in this
     process. This limits VRAM usage from video decoding libraries like
     PyNvVideoCodec that allocate VRAM separately from PyTorch."""
+    video_profiling: VideoProfilingConfig | None = None
+    """Configuration for video VRAM profiling when using hardware-accelerated
+    video decoding (e.g., PyNvVideoCodec). Specifies video dimensions and frame
+    counts used during memory profiling to accurately reserve VRAM.
+    
+    Example: {"width": 1920, "height": 1080, "frames": 32, "proc_width": 512, 
+    "proc_height": 512}
+    
+    If proc_width/proc_height are omitted, they default to width/height."""
     multimodal_tensor_ipc: bool | None = None
     """Enable IPC (inter-process communication) for multimodal tensors.
     When enabled, all multimodal tensors (CUDA and CPU) are transferred
@@ -151,6 +193,17 @@ class MultiModalConfig:
     When disabled, all tensors use standard serialization.
     If None, defaults to the value of VLLM_MULTIMODAL_TENSOR_IPC environment
     variable (default: True)."""
+
+    @field_validator("video_profiling", mode="before")
+    @classmethod
+    def _validate_video_profiling(
+        cls, value: dict[str, int] | None
+    ) -> VideoProfilingConfig | None:
+        if value is None:
+            return None
+        if isinstance(value, VideoProfilingConfig):
+            return value
+        return VideoProfilingConfig(**value)
 
     @field_validator("limit_per_prompt", mode="before")
     @classmethod

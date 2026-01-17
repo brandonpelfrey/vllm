@@ -310,6 +310,7 @@ class ModelConfig:
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
     maximum_concurrent_videos: InitVar[int | None] = None
+    video_profiling: InitVar[str | dict[str, int] | None] = None
     multimodal_tensor_ipc: InitVar[bool | None] = None
 
     def compute_hash(self) -> str:
@@ -426,6 +427,7 @@ class ModelConfig:
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
         maximum_concurrent_videos: int | None,
+        video_profiling: str | dict[str, int] | None,
         multimodal_tensor_ipc: bool | None,
     ) -> None:
         # Keep set served_model_name before maybe_model_redirect(self.model)
@@ -577,6 +579,20 @@ class ModelConfig:
                 )
                 mm_encoder_tp_mode = "weights"
 
+            # Parse video_profiling JSON string if provided
+            parsed_video_profiling = None
+            if video_profiling is not None:
+                if isinstance(video_profiling, str):
+                    import json
+                    try:
+                        parsed_video_profiling = json.loads(video_profiling)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(
+                            f"Invalid JSON for --video-profiling: {e}"
+                        ) from e
+                else:
+                    parsed_video_profiling = video_profiling
+
             mm_config_kwargs = dict(
                 limit_per_prompt=limit_mm_per_prompt,
                 enable_mm_embeds=enable_mm_embeds,
@@ -591,6 +607,7 @@ class ModelConfig:
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,
                 max_concurrent_videos=maximum_concurrent_videos,
+                video_profiling=parsed_video_profiling,
                 multimodal_tensor_ipc=multimodal_tensor_ipc,
             )
 

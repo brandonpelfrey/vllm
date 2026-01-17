@@ -478,6 +478,7 @@ class EngineArgs:
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float = MultiModalConfig.video_pruning_rate
     maximum_concurrent_videos: int | None = MultiModalConfig.max_concurrent_videos
+    video_profiling: str | None = None
     multimodal_tensor_ipc: bool | None = MultiModalConfig.multimodal_tensor_ipc
     # LoRA fields
     enable_lora: bool = False
@@ -1000,6 +1001,19 @@ class EngineArgs:
             help="Maximum number of videos that can be preprocessed concurrently. "
             "This limits VRAM usage from video decoding. The count is spread "
             "evenly over API server processes.",
+        )
+        multimodal_group.add_argument(
+            "--video-profiling",
+            type=str,
+            default=None,
+            help="JSON string specifying video dimensions for VRAM profiling when "
+            "using hardware-accelerated video decoding (e.g., PyNvVideoCodec). "
+            "Format: '{\"width\": 1920, \"height\": 1080, \"frames\": 32, "
+            "\"proc_width\": 512, \"proc_height\": 512}'. "
+            "The 'width', 'height', and 'frames' specify raw decoded video dimensions. "
+            "The optional 'proc_width' and 'proc_height' specify dimensions after "
+            "model preprocessing (defaults to width/height if omitted). "
+            "Used only for memory profiling, not actual video processing.",
         )
         multimodal_group.add_argument(
             "--enable-multimodal-tensor-ipc",

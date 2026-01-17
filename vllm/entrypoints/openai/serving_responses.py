@@ -387,8 +387,6 @@ class OpenAIServingResponses(OpenAIServing):
                     if isinstance(item, dict):
                         content = item.get("content")
                         video_count += count_videos_in_content_parts(content)
-            if video_count > 0:
-                logger.debug("Request has %d video(s), will acquire semaphore", video_count)
         except Exception as e:
             logger.warning("Failed to count videos in request: %s", e)
             video_count = 0
@@ -418,7 +416,16 @@ class OpenAIServingResponses(OpenAIServing):
         Wrapper for streaming responses that holds the video semaphore
         while the stream is being consumed.
         """
+        # IMPORTANT: For video_count=0, skip semaphore entirely
+        if video_count == 0:
+            result = await self._create_responses_inner(request, raw_request)
+            async for item in result:
+                yield item
+            return
+        
+        # Use the async context manager for clean semaphore handling
         async with self._media_connector.acquire_video_semaphore(video_count):
+            # Call the inner function and iterate over its results
             result = await self._create_responses_inner(request, raw_request)
             # result should be an AsyncGenerator for streaming
             async for item in result:
