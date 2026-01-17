@@ -38,6 +38,12 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.multimodal.video_memory import (
+    allocate_video_memory_stress,
+    calculate_decoder_memory_bytes,
+    calculate_total_video_memory_bytes,
+    get_video_memory_config_from_vllm_config,
+)
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
@@ -330,13 +336,53 @@ class Worker(WorkerBase):
             logger.info(msg)
             return kv_cache_memory_bytes
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # Get video memory configuration for profiling
+        video_config = get_video_memory_config_from_vllm_config(self.vllm_config)
+        video_stress_tensors = []
+        video_decoder_memory = 0
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # If using video profiling config, stress VRAM with video frame buffers
+            if video_config["needs_profiling"]:
+                logger.info(
+                    "Profiling with video decoder VRAM stress: %dx%d raw resolution, "
+                    "%dx%d processed resolution, %d frames, %d max concurrent videos",
+                    video_config["width"],
+                    video_config["height"],
+                    video_config["proc_width"],
+                    video_config["proc_height"],
+                    video_config["num_frames"],
+                    video_config["max_concurrent_videos"],
+                )
+                
+                # Allocate video frame buffers to stress VRAM
+                video_stress_tensors = allocate_video_memory_stress(
+                    width=video_config["width"],
+                    height=video_config["height"],
+                    num_frames=video_config["num_frames"],
+                    max_concurrent_videos=video_config["max_concurrent_videos"],
+                    device=self.device,
+                    proc_width=video_config["proc_width"],
+                    proc_height=video_config["proc_height"],
+                )
+                
+                # Calculate decoder overhead (not allocated as tensors)
+                video_decoder_memory = calculate_decoder_memory_bytes(
+                    max_concurrent_videos=video_config["max_concurrent_videos"],
+                )
+            
             self.model_runner.profile_run()
+            
+            # Keep video stress tensors alive during profiling
+            # They will be cleaned up after this context
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -353,9 +399,19 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
+        
+        # Calculate available KV cache memory, accounting for video decoder overhead
+        # The video frame buffers are already included in profile_result.non_kv_cache_memory
+        # via torch peak tracking, but decoder instances use non-torch VRAM
         self.available_kv_cache_memory_bytes = (
-            self.requested_memory - profile_result.non_kv_cache_memory
+            self.requested_memory - profile_result.non_kv_cache_memory - video_decoder_memory
         )
+        
+        if video_decoder_memory > 0:
+            logger.info(
+                "Reserved %s GiB for video decoder instances",
+                format_gib(video_decoder_memory),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

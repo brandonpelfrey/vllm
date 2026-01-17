@@ -1607,18 +1607,27 @@ def count_videos_in_messages(messages: list[ChatCompletionMessageParam]) -> int:
     """
     video_count = 0
     
-    for msg in messages:
-        content = msg.get("content")
-        if content is None or isinstance(content, str):
-            continue
-            
-        # Content is a list of parts
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    part_type = part.get("type")
-                    if part_type == "video_url":
-                        video_count += 1
+    if not messages:
+        return 0
+    
+    try:
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if content is None or isinstance(content, str):
+                continue
+                
+            # Content is a list of parts
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = part.get("type")
+                        if part_type == "video_url":
+                            video_count += 1
+    except Exception:
+        # Silently handle any unexpected errors in video counting
+        return 0
     
     return video_count
 
