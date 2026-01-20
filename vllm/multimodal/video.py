@@ -439,6 +439,10 @@ class PyNVVideoCodecBackend(VideoLoader):
     # initialization cost within each worker thread.
     _thread_local: threading.local = threading.local()
 
+    _cuda_stream: torch.cuda.Stream | None = None
+    _cuda_stream_lock = threading.Lock()
+    _checked_is_mps_enabled = False
+
     @classmethod
     def _get_thread_decoder(cls):
         return getattr(cls._thread_local, "decoder", None)
@@ -447,8 +451,16 @@ class PyNVVideoCodecBackend(VideoLoader):
     def _set_thread_decoder(cls, decoder):
         cls._thread_local.decoder = decoder
 
-    _cuda_stream: torch.cuda.Stream | None = None
-    _cuda_stream_lock = threading.Lock()
+    @classmethod
+    def _check_is_mps_enabled(cls):
+        """Check if CUDA MPS is enabled."""
+        if cls._checked_is_mps_enabled:
+            return
+        cls._checked_is_mps_enabled = True
+
+        mps_path = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+        if not os.path.exists(os.path.join(mps_path, "control")):
+            logger.warning("CUDA MPS is not enabled. PyNVVideoCodec performance will be degraded.")
 
     @classmethod
     def get_cuda_stream(cls):
@@ -467,6 +479,8 @@ class PyNVVideoCodecBackend(VideoLoader):
         fps: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         import PyNvVideoCodec as nvc
+
+        cls._check_is_mps_enabled()
 
         gpu_id = torch.cuda.current_device()
         cuda_stream = cls.get_cuda_stream()
