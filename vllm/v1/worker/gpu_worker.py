@@ -39,9 +39,7 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video_memory import (
-    allocate_video_memory_stress,
-    calculate_decoder_memory_bytes,
-    calculate_total_video_memory_bytes,
+    calculate_pynvvideocodec_per_thread_usage,
     calculate_video_frame_memory_bytes,
     get_video_memory_config_from_vllm_config,
 )
@@ -90,6 +88,12 @@ class Worker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        # Ensure pynvvideocodec requires TP=1 and DP=1
+        assert (envs.VLLM_VIDEO_LOADER_BACKEND != "pynvvideocodec" or 
+                (vllm_config.parallel_config.tensor_parallel_size == 1 and 
+                 vllm_config.parallel_config.data_parallel_size == 1)), \
+            "pynvvideocodec video loader requires tensor_parallel_size=1 and data_parallel_size=1"
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
@@ -354,7 +358,7 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             # If using video profiling config, stress VRAM with video frame buffers
-            if video_config["needs_profiling"]:
+            if video_config["needs_profiling"] and envs.VLLM_VIDEO_LOADER_BACKEND == "pynvvideocodec":
                 logger.info(
                     "Profiling with video decoder VRAM stress: %dx%d raw resolution, "
                     "%dx%d processed resolution, %d frames, %d max concurrent videos",
@@ -365,59 +369,51 @@ class Worker(WorkerBase):
                     video_config["num_frames"],
                     video_config["max_concurrent_videos"],
                 )
-                
-                # Calculate individual memory components for logging
-                raw_frame_memory = calculate_video_frame_memory_bytes(
-                    width=video_config["width"],
-                    height=video_config["height"],
+
+                # Calculate total amount of memory needed to hold raw video frames passed
+                # to vision encoding. If processed width/height are provided, then these are
+                # the dimensions to consider in-flight up until the vision encoder.
+                loaded_width = video_config["width"] if video_config["proc_width"] is None else video_config["proc_width"]
+                loaded_height = video_config["height"] if video_config["proc_height"] is None else video_config["proc_height"]
+                processed_frames_memory_bytes = calculate_video_frame_memory_bytes(
+                    width=loaded_width,
+                    height=loaded_height,
                     num_frames=video_config["num_frames"],
                     max_concurrent_videos=video_config["max_concurrent_videos"],
                     bytes_per_pixel=3,  # RGB
                 )
-                
-                # Calculate processed frame memory if dimensions differ
-                proc_frame_memory = 0
-                if (video_config["proc_width"] != video_config["width"] or 
-                    video_config["proc_height"] != video_config["height"]):
-                    proc_frame_memory = calculate_video_frame_memory_bytes(
-                        width=video_config["proc_width"],
-                        height=video_config["proc_height"],
-                        num_frames=video_config["num_frames"],
-                        max_concurrent_videos=video_config["max_concurrent_videos"],
-                        bytes_per_pixel=3,  # RGB
-                    )
-                
+
+                # In addition to processed frames sitting in front of the vision encoder, there
+                # are up to API Server Count * VLLM_MEDIA_LOADING_THREAD_COUNT threads loading
+                # video frames, each holding on to raw and processed frames.
+                total_decoder_threads = self.vllm_config.parallel_config._api_process_count * envs.VLLM_MEDIA_LOADING_THREAD_COUNT
+
                 # Calculate decoder overhead (not allocated as tensors)
-                video_decoder_memory = calculate_decoder_memory_bytes(
-                    max_concurrent_videos=video_config["max_concurrent_videos"],
-                )
-                
-                # Log the detailed VRAM breakdown
-                total_video_memory = raw_frame_memory + proc_frame_memory + video_decoder_memory
-                logger.info(
-                    "Video VRAM profiling breakdown: "
-                    "Raw frames: %s GiB, Processed frames: %s GiB, Decoders: %s GiB, Total: %s GiB",
-                    format_gib(raw_frame_memory),
-                    format_gib(proc_frame_memory),
-                    format_gib(video_decoder_memory),
-                    format_gib(total_video_memory),
-                )
-                
-                # Allocate video frame buffers to stress VRAM
-                video_stress_tensors = allocate_video_memory_stress(
+                decoder_vram_per_thread = calculate_pynvvideocodec_per_thread_usage(
                     width=video_config["width"],
                     height=video_config["height"],
-                    num_frames=video_config["num_frames"],
-                    max_concurrent_videos=video_config["max_concurrent_videos"],
-                    device=self.device,
-                    proc_width=video_config["proc_width"],
-                    proc_height=video_config["proc_height"],
+                    batch_size=10,
                 )
-            
+                total_decoder_vram = decoder_vram_per_thread * total_decoder_threads
+
+                # Log the detailed VRAM breakdown
+                total_video_memory = processed_frames_memory_bytes + total_decoder_vram
+                logger.info(
+                    "Video VRAM profiling breakdown: "
+                    "Processed frames: %s GiB, Decoders: %s GiB, Total: %s GiB",
+                    format_gib(processed_frames_memory_bytes),
+                    format_gib(total_decoder_vram),
+                    format_gib(total_video_memory),
+                )
+
+                # Simulate allocation of all this VRAM
+                video_decoder_vram = torch.empty(
+                    total_video_memory,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+
             self.model_runner.profile_run()
-            
-            # Keep video stress tensors alive during profiling
-            # They will be cleaned up after this context
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -434,14 +430,14 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        
+
         # Calculate available KV cache memory, accounting for video decoder overhead
         # The video frame buffers are already included in profile_result.non_kv_cache_memory
         # via torch peak tracking, but decoder instances use non-torch VRAM
         self.available_kv_cache_memory_bytes = (
             self.requested_memory - profile_result.non_kv_cache_memory - video_decoder_memory
         )
-        
+
         if video_decoder_memory > 0:
             logger.info(
                 "Reserved %s GiB for video decoder instances",
