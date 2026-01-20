@@ -247,3 +247,61 @@ def test_allocate_video_memory_stress_oom_handling():
     
     # Should return empty list on OOM
     assert len(tensors) == 0
+
+
+def test_video_memory_breakdown_calculations():
+    """Test that video memory breakdown calculations are correct."""
+    # Test case 1: Basic configuration without preprocessing
+    width = 1920
+    height = 1080
+    num_frames = 32
+    max_concurrent_videos = 4
+    
+    raw_frame_memory = calculate_video_frame_memory_bytes(
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        max_concurrent_videos=max_concurrent_videos,
+        bytes_per_pixel=3,
+    )
+    
+    decoder_memory = calculate_decoder_memory_bytes(
+        max_concurrent_videos=max_concurrent_videos,
+    )
+    
+    # When proc dimensions match raw dimensions, proc_frame_memory should be 0
+    proc_frame_memory = 0
+    total = raw_frame_memory + proc_frame_memory + decoder_memory
+    
+    # Verify raw frame memory calculation
+    expected_raw = width * height * 3 * num_frames * max_concurrent_videos
+    assert raw_frame_memory == expected_raw
+    
+    # Verify decoder memory calculation
+    expected_decoder = 100 * 1024 * 1024 * max_concurrent_videos
+    assert decoder_memory == expected_decoder
+    
+    # Verify total
+    assert total == expected_raw + expected_decoder
+    
+    # Test case 2: With preprocessing
+    proc_width = 512
+    proc_height = 512
+    
+    proc_frame_memory = calculate_video_frame_memory_bytes(
+        width=proc_width,
+        height=proc_height,
+        num_frames=num_frames,
+        max_concurrent_videos=max_concurrent_videos,
+        bytes_per_pixel=3,
+    )
+    
+    total_with_proc = raw_frame_memory + proc_frame_memory + decoder_memory
+    
+    # Verify processed frame memory calculation
+    expected_proc = proc_width * proc_height * 3 * num_frames * max_concurrent_videos
+    assert proc_frame_memory == expected_proc
+    
+    # Verify total includes both raw and processed
+    assert total_with_proc == expected_raw + expected_proc + expected_decoder
+    assert total_with_proc > total  # Should be larger with preprocessing
