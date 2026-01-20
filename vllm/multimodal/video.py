@@ -5,6 +5,7 @@ import math
 from abc import abstractmethod
 from functools import partial
 from io import BytesIO
+import os
 from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any
@@ -481,6 +482,11 @@ class PyNVVideoCodecBackend(VideoLoader):
         return cls._cuda_stream
 
     @classmethod
+    def num_decoders_per_instance(cls):
+        """Number of pynvvideocodec internal decoders to keep cached for different video formats."""
+        return 2
+
+    @classmethod
     def _decode_from_file(
         cls,
         file_path: str,
@@ -509,7 +515,7 @@ class PyNVVideoCodecBackend(VideoLoader):
                     need_scanned_stream_metadata=False,
                     gpu_id=gpu_id,
                     cuda_stream=cuda_stream_handle,
-                    decoder_cache_size=2,
+                    decoder_cache_size=cls.num_decoders_per_instance(),
                 )
                 cls._set_thread_decoder(decoder)
 
@@ -529,9 +535,8 @@ class PyNVVideoCodecBackend(VideoLoader):
                 fps = min(fps, original_fps)
                 num_frames = int(total_frames_num * fps / original_fps)
                 num_frames = max(1, num_frames)
-            
-            full_read = (num_frames == -1
-                            or total_frames_num <= num_frames)
+
+            full_read = num_frames == -1 or total_frames_num <= num_frames
             if full_read:
                 num_frames = total_frames_num
                 frame_idx = list(range(0, num_frames))
@@ -585,7 +590,7 @@ class PyNVVideoCodecBackend(VideoLoader):
         `--media-io-kwargs '{"video":{"fps": <fps>}}'`. If `fps > 0`, then
         `num_frames` is derived from the original fps of the video. When
         `fps == 0`, the behavior is the same as not specifying fps at all.
-        
+
         Returns:
             A tuple of (frames, metadata) where frames is a torch.Tensor on GPU
             in (N, H, W, C) format.
@@ -660,7 +665,7 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
         # Ensure CPU numpy array before attempting to encode
         if isinstance(video, torch.Tensor):
             video = media.cpu().numpy()
-        else: 
+        else:
             video = media
 
         if video_format == "JPEG":
