@@ -1331,6 +1331,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             maximum_concurrent_videos=self.maximum_concurrent_videos,
+            video_profiling=self.video_profiling,
             multimodal_tensor_ipc=self.multimodal_tensor_ipc,
             io_processor_plugin=self.io_processor_plugin,
         )

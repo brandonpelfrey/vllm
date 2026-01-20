@@ -42,6 +42,7 @@ from vllm.multimodal.video_memory import (
     allocate_video_memory_stress,
     calculate_decoder_memory_bytes,
     calculate_total_video_memory_bytes,
+    calculate_video_frame_memory_bytes,
     get_video_memory_config_from_vllm_config,
 )
 from vllm.platforms import current_platform
@@ -340,7 +341,9 @@ class Worker(WorkerBase):
         torch.cuda.reset_peak_memory_stats()
 
         # Get video memory configuration for profiling
+        logger.info("Checking for video profiling configuration...")
         video_config = get_video_memory_config_from_vllm_config(self.vllm_config)
+        logger.info(f"Video config returned: needs_profiling={video_config['needs_profiling']}")
         video_stress_tensors = []
         video_decoder_memory = 0
 
@@ -363,6 +366,43 @@ class Worker(WorkerBase):
                     video_config["max_concurrent_videos"],
                 )
                 
+                # Calculate individual memory components for logging
+                raw_frame_memory = calculate_video_frame_memory_bytes(
+                    width=video_config["width"],
+                    height=video_config["height"],
+                    num_frames=video_config["num_frames"],
+                    max_concurrent_videos=video_config["max_concurrent_videos"],
+                    bytes_per_pixel=3,  # RGB
+                )
+                
+                # Calculate processed frame memory if dimensions differ
+                proc_frame_memory = 0
+                if (video_config["proc_width"] != video_config["width"] or 
+                    video_config["proc_height"] != video_config["height"]):
+                    proc_frame_memory = calculate_video_frame_memory_bytes(
+                        width=video_config["proc_width"],
+                        height=video_config["proc_height"],
+                        num_frames=video_config["num_frames"],
+                        max_concurrent_videos=video_config["max_concurrent_videos"],
+                        bytes_per_pixel=3,  # RGB
+                    )
+                
+                # Calculate decoder overhead (not allocated as tensors)
+                video_decoder_memory = calculate_decoder_memory_bytes(
+                    max_concurrent_videos=video_config["max_concurrent_videos"],
+                )
+                
+                # Log the detailed VRAM breakdown
+                total_video_memory = raw_frame_memory + proc_frame_memory + video_decoder_memory
+                logger.info(
+                    "Video VRAM profiling breakdown: "
+                    "Raw frames: %s GiB, Processed frames: %s GiB, Decoders: %s GiB, Total: %s GiB",
+                    format_gib(raw_frame_memory),
+                    format_gib(proc_frame_memory),
+                    format_gib(video_decoder_memory),
+                    format_gib(total_video_memory),
+                )
+                
                 # Allocate video frame buffers to stress VRAM
                 video_stress_tensors = allocate_video_memory_stress(
                     width=video_config["width"],
@@ -372,11 +412,6 @@ class Worker(WorkerBase):
                     device=self.device,
                     proc_width=video_config["proc_width"],
                     proc_height=video_config["proc_height"],
-                )
-                
-                # Calculate decoder overhead (not allocated as tensors)
-                video_decoder_memory = calculate_decoder_memory_bytes(
-                    max_concurrent_videos=video_config["max_concurrent_videos"],
                 )
             
             self.model_runner.profile_run()
