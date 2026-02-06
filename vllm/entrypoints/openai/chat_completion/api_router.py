@@ -57,6 +57,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except Exception as e:
+        logger.exception("Error in create_chat_completion: %s", e)
         return handler.create_error_response(e)
 
     if isinstance(generator, ErrorResponse):
@@ -94,7 +95,7 @@ async def render_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     try:
-        result = await handler.render_chat_request(request)
+        result = await handler.render_chat_request(request, raw_request)
     except Exception as e:
         return handler.create_error_response(e)
 
