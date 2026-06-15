@@ -676,6 +676,7 @@ class PyNvVideoCodecVideoBackendMixin:
                         len(frame_idx),
                         len(decoded_frames),
                     )
+                torch.accelerator.empty_cache()
                 torch_frames = [torch.from_dlpack(frame) for frame in decoded_frames]
                 if not torch_frames:
                     return np.empty((0,), dtype=np.uint8)
@@ -1110,7 +1111,7 @@ class GLM46VVideoBackend(VideoBackend):
         max_duration: int = 300,
         frame_recovery: bool = False,
         *,
-        backend: Literal["opencv", "pyav"] = "opencv",
+        backend: Literal["opencv", "pyav", "pynvvideocodec"] = "opencv",
         **kwargs,
     ) -> tuple[npt.NDArray, dict[str, Any]]:
         return super().load_bytes(

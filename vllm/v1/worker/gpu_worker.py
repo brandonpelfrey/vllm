@@ -532,10 +532,14 @@ class Worker(WorkerBase):
 
     @staticmethod
     def _uses_pynvvideocodec_video_backend(mm_config) -> bool:
-        video_backend = mm_config.media_io_kwargs.get("video", {}).get("video_backend")
+        video_kwargs = mm_config.media_io_kwargs.get("video", {})
+        video_loader_backend = (
+            video_kwargs.get("video_backend") or envs.VLLM_VIDEO_LOADER_BACKEND
+        )
+        codec_backend = video_kwargs.get("backend")
         return (
-            video_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
-            or envs.VLLM_VIDEO_LOADER_BACKEND == PYNVVIDEOCODEC_VIDEO_BACKEND
+            video_loader_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
+            or codec_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
         )
 
     def _reserve_mm_ipc_gpu_memory(self, available_kv_cache_memory_bytes: int) -> int:
