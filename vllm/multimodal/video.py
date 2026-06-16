@@ -186,7 +186,10 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Fixed upper bound reserved for persistent PyNvVideoCodec decoder surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
-PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 2
+# One slot serializes the decode path. The slot's CUDA stream is created on one
+# thread but borrowed on connector worker threads; concurrent construct+decode
+# trips a stream/context mismatch (CUDA err 801). Decode is not the bottleneck.
+PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 1
 
 
 class PyNvVideoCodecDecoderSlot:
@@ -198,7 +201,10 @@ class PyNvVideoCodecDecoderSlot:
         self.source_path: str | None = None
 
     def get_decoder(self, file_path: str, nvc, device_index: int):
-        if self.decoder is None:
+        # Every request writes a fresh temp path, so reconfigure_decoder() would
+        # run on each call and crashes (HandlePictureDisplay illegal access).
+        # Construct a fresh decoder whenever the source path changes instead.
+        if self.decoder is None or self.source_path != file_path:
             self.decoder = nvc.SimpleDecoder(
                 file_path,
                 output_color_type=nvc.OutputColorType.RGB,
@@ -208,9 +214,6 @@ class PyNvVideoCodecDecoderSlot:
                 cuda_stream=self.stream.cuda_stream,
                 decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
             )
-            self.source_path = file_path
-        elif self.source_path != file_path:
-            self.decoder.reconfigure_decoder(file_path)
             self.source_path = file_path
 
         return self.decoder
@@ -564,6 +567,10 @@ class PyNvVideoCodecVideoBackendMixin:
     def _torch_stream_context(stream):
         import torch
 
+        # The slot stream is borrowed on connector worker threads that may have no
+        # current CUDA context; make the stream's device current so PyNvVideoCodec
+        # can validate the stream against its context (else CUDA err 801).
+        torch.cuda.set_device(stream.device)
         previous_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(stream)
         try:
@@ -676,7 +683,6 @@ class PyNvVideoCodecVideoBackendMixin:
                         len(frame_idx),
                         len(decoded_frames),
                     )
-                torch.accelerator.empty_cache()
                 torch_frames = [torch.from_dlpack(frame) for frame in decoded_frames]
                 if not torch_frames:
                     return np.empty((0,), dtype=np.uint8)
@@ -697,7 +703,6 @@ class PyNvVideoCodecVideoBackendMixin:
                 stream.synchronize()
                 host_array = host_frames.numpy()
                 del decoded_frames, torch_frames, device_frames
-                torch.accelerator.empty_cache()
                 return host_array
 
     @classmethod
@@ -1646,3 +1651,14 @@ class OpenCVDynamicOpenPanguVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
             valid_frame_indices=valid_frame_indices,
         )
         return frames, metadata
+
+
+# Eagerly register PyNvVideoCodec's pybind11 types at module import, on a single
+# thread. Without this, concurrent first-imports from worker threads race the C++
+# type registry and raise "Unregistered type: SimpleDecoder" (PyNvVideoCodec
+# 2.0.4). Guarded: the backend is optional.
+try:
+    import PyNvVideoCodec  # noqa: F401
+    import PyNvVideoCodec.decoders.SimpleDecoder  # noqa: F401
+except Exception:
+    pass
