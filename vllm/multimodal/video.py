@@ -186,9 +186,6 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Fixed upper bound reserved for persistent PyNvVideoCodec decoder surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
-# One slot serializes the decode path. The slot's CUDA stream is created on one
-# thread but borrowed on connector worker threads; concurrent construct+decode
-# trips a stream/context mismatch (CUDA err 801). Decode is not the bottleneck.
 PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 1
 
 
@@ -201,9 +198,6 @@ class PyNvVideoCodecDecoderSlot:
         self.source_path: str | None = None
 
     def get_decoder(self, file_path: str, nvc, device_index: int):
-        # Every request writes a fresh temp path, so reconfigure_decoder() would
-        # run on each call and crashes (HandlePictureDisplay illegal access).
-        # Construct a fresh decoder whenever the source path changes instead.
         if self.decoder is None or self.source_path != file_path:
             self.decoder = nvc.SimpleDecoder(
                 file_path,
@@ -567,10 +561,7 @@ class PyNvVideoCodecVideoBackendMixin:
     def _torch_stream_context(stream):
         import torch
 
-        # The slot stream is borrowed on connector worker threads that may have no
-        # current CUDA context; make the stream's device current so PyNvVideoCodec
-        # can validate the stream against its context (else CUDA err 801).
-        torch.cuda.set_device(stream.device)
+        torch.accelerator.set_device_index(stream.device.index)
         previous_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(stream)
         try:
@@ -623,40 +614,41 @@ class PyNvVideoCodecVideoBackendMixin:
         file_path: str,
         nvc,
     ) -> PyNvVideoCodecSourceMetadata:
-        metadata_decoder = nvc.SimpleDecoder(
-            file_path,
-            output_color_type=nvc.OutputColorType.RGB,
-            use_device_memory=False,
-            need_scanned_stream_metadata=True,
-            decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
-        )
-        metadata = metadata_decoder.get_stream_metadata()
-        total_frames_num = len(metadata_decoder)
-        width = int(cls._metadata_value(metadata, "width", default=0))
-        height = int(cls._metadata_value(metadata, "height", default=0))
-        original_fps = float(
-            cls._metadata_value(
-                metadata,
-                "average_fps",
-                "avg_frame_rate",
-                "frame_rate",
-                "frameRate",
-                default=0.0,
+        with cls._borrow_decoder_slot():
+            metadata_decoder = nvc.SimpleDecoder(
+                file_path,
+                output_color_type=nvc.OutputColorType.RGB,
+                use_device_memory=False,
+                need_scanned_stream_metadata=True,
+                decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
             )
-        )
-        duration = float(
-            cls._metadata_value(metadata, "duration", default=0.0)
-            or (total_frames_num / original_fps if original_fps > 0 else 0.0)
-        )
-        if total_frames_num <= 0:
-            raise ValueError("Could not determine video frame count")
-        if width <= 0 or height <= 0:
-            raise ValueError("Could not determine video dimensions")
-        return PyNvVideoCodecSourceMetadata(
-            source=VideoSourceMetadata(total_frames_num, original_fps, duration),
-            width=width,
-            height=height,
-        )
+            metadata = metadata_decoder.get_stream_metadata()
+            total_frames_num = len(metadata_decoder)
+            width = int(cls._metadata_value(metadata, "width", default=0))
+            height = int(cls._metadata_value(metadata, "height", default=0))
+            original_fps = float(
+                cls._metadata_value(
+                    metadata,
+                    "average_fps",
+                    "avg_frame_rate",
+                    "frame_rate",
+                    "frameRate",
+                    default=0.0,
+                )
+            )
+            duration = float(
+                cls._metadata_value(metadata, "duration", default=0.0)
+                or (total_frames_num / original_fps if original_fps > 0 else 0.0)
+            )
+            if total_frames_num <= 0:
+                raise ValueError("Could not determine video frame count")
+            if width <= 0 or height <= 0:
+                raise ValueError("Could not determine video dimensions")
+            return PyNvVideoCodecSourceMetadata(
+                source=VideoSourceMetadata(total_frames_num, original_fps, duration),
+                width=width,
+                height=height,
+            )
 
     @classmethod
     def _decode_to_pinned_host(
@@ -1651,14 +1643,3 @@ class OpenCVDynamicOpenPanguVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
             valid_frame_indices=valid_frame_indices,
         )
         return frames, metadata
-
-
-# Eagerly register PyNvVideoCodec's pybind11 types at module import, on a single
-# thread. Without this, concurrent first-imports from worker threads race the C++
-# type registry and raise "Unregistered type: SimpleDecoder" (PyNvVideoCodec
-# 2.0.4). Guarded: the backend is optional.
-try:
-    import PyNvVideoCodec  # noqa: F401
-    import PyNvVideoCodec.decoders.SimpleDecoder  # noqa: F401
-except Exception:
-    pass
