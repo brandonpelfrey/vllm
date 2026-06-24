@@ -191,6 +191,16 @@ PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
 PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = int(
     os.getenv("PYNVVIDEOCODEC_MAX_RETAINED_DECODERS", "1")
 )
+# Per-API-server NVDEC/CUVID CUDA context + driver allocations that live on the
+# GPU but OUTSIDE vLLM's gpu_memory_utilization pool: each api_server_count
+# process creates its own. Measured ~1.8 GiB/server on H100. The worker's KV
+# reservation multiplies (this + decoder surfaces) by api_server_count so that
+# total GPU usage stays within gpu_memory_utilization; otherwise HW decode
+# silently overshoots the budget and OOMs at high gmu (SW decode does not, since
+# it allocates nothing on the GPU per server). Env-tunable for other GPUs.
+PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES = int(
+    float(os.getenv("PYNVVIDEOCODEC_CUDA_CONTEXT_GB", "1.8")) * 1024 * MiB_bytes
+)
 
 
 class PyNvVideoCodecDecoderSlot:
