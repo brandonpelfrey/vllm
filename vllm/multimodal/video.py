@@ -186,30 +186,52 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Fixed upper bound reserved for persistent PyNvVideoCodec decoder surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
-PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 1
+# Max concurrent thread-confined GPU decodes (one CUDA stream + decoder each).
+# Env-tunable; default 1 preserves the conservative serialize-to-1 behavior.
+PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = int(
+    os.getenv("PYNVVIDEOCODEC_MAX_RETAINED_DECODERS", "1")
+)
 
 
 class PyNvVideoCodecDecoderSlot:
-    """A retained PyNv decoder slot and its CUDA stream."""
+    """A retained PyNv decoder slot and its CUDA stream.
+
+    The decoder is reused across requests: ``reconfigure_decoder`` repoints the
+    existing decoder at each new source instead of paying a fresh
+    ``SimpleDecoder`` construction per request. Construction (CUVID parser +
+    decoder + surface-pool allocation) is the dominant per-request cost, so
+    reconfiguring is far cheaper. A single decoder serves both metadata
+    (``len``/``get_stream_metadata``) and frame decode -- no separate
+    metadata decoder.
+    """
 
     def __init__(self, stream) -> None:
         self.stream = stream
         self.decoder = None
         self.source_path: str | None = None
 
-    def get_decoder(self, file_path: str, nvc, device_index: int):
-        if self.decoder is None or self.source_path != file_path:
-            self.decoder = nvc.SimpleDecoder(
-                file_path,
-                output_color_type=nvc.OutputColorType.RGB,
-                use_device_memory=True,
-                need_scanned_stream_metadata=False,
-                gpu_id=device_index,
-                cuda_stream=self.stream.cuda_stream,
-                decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
-            )
-            self.source_path = file_path
+    def _construct(self, file_path: str, nvc, device_index: int) -> None:
+        self.decoder = nvc.SimpleDecoder(
+            file_path,
+            output_color_type=nvc.OutputColorType.RGB,
+            use_device_memory=True,
+            need_scanned_stream_metadata=True,
+            gpu_id=device_index,
+            cuda_stream=self.stream.cuda_stream,
+            decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
+        )
+        self.source_path = file_path
 
+    def get_decoder(self, file_path: str, nvc, device_index: int):
+        if self.decoder is None:
+            self._construct(file_path, nvc, device_index)
+        elif self.source_path != file_path:
+            try:
+                self.decoder.reconfigure_decoder(file_path)
+                self.source_path = file_path
+            except Exception:
+                # reconfigure unsupported/unsafe for this source -> rebuild.
+                self._construct(file_path, nvc, device_index)
         return self.decoder
 
 
@@ -614,16 +636,13 @@ class PyNvVideoCodecVideoBackendMixin:
         file_path: str,
         nvc,
     ) -> PyNvVideoCodecSourceMetadata:
-        with cls._borrow_decoder_slot():
-            metadata_decoder = nvc.SimpleDecoder(
-                file_path,
-                output_color_type=nvc.OutputColorType.RGB,
-                use_device_memory=False,
-                need_scanned_stream_metadata=True,
-                decoder_cache_size=PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
-            )
-            metadata = metadata_decoder.get_stream_metadata()
-            total_frames_num = len(metadata_decoder)
+        with cls._borrow_decoder_slot() as decoder_slot:
+            with cls._torch_stream_context(decoder_slot.stream):
+                decoder = decoder_slot.get_decoder(
+                    file_path, nvc, device_index=cls._DEVICE_INDEX
+                )
+                metadata = decoder.get_stream_metadata()
+                total_frames_num = len(decoder)
             width = int(cls._metadata_value(metadata, "width", default=0))
             height = int(cls._metadata_value(metadata, "height", default=0))
             original_fps = float(
