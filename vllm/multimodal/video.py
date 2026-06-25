@@ -4,6 +4,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from abc import abstractmethod
 from contextlib import contextmanager, suppress
 from io import BytesIO
@@ -200,6 +201,16 @@ PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = int(
 # it allocates nothing on the GPU per server). Env-tunable for other GPUs.
 PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES = int(
     float(os.getenv("PYNVVIDEOCODEC_CUDA_CONTEXT_GB", "1.8")) * 1024 * MiB_bytes
+)
+# Opt-in per-video HW-decode wall-time logging for the issue-#365 long-video
+# TTFT-attribution campaign. Default OFF: zero behavior change unless enabled.
+# When set, _decode_to_pinned_host emits one greppable DECODE_TIMING INFO line
+# per decoded video (elapsed_ms + frame_count + source identifier).
+PYNVC_DECODE_TIMING = os.getenv("PYNVC_DECODE_TIMING", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
 )
 
 
@@ -697,6 +708,7 @@ class PyNvVideoCodecVideoBackendMixin:
                 decoder = decoder_slot.get_decoder(
                     file_path, nvc, device_index=cls._DEVICE_INDEX
                 )
+                decode_t0 = time.monotonic() if PYNVC_DECODE_TIMING else 0.0
                 decoded_frames = decoder.get_batch_frames_by_index(frame_idx)
                 if len(decoded_frames) < len(frame_idx):
                     logger.warning(
@@ -722,6 +734,15 @@ class PyNvVideoCodecVideoBackendMixin:
                 )
                 host_frames.copy_(device_frames, non_blocking=True)
                 stream.synchronize()
+                if PYNVC_DECODE_TIMING:
+                    # stream.synchronize() above forces the async NVDEC decode +
+                    # D2H copy to complete, so this measures true decode wall-time.
+                    logger.info(
+                        "DECODE_TIMING elapsed_ms=%.3f frame_count=%d source=%s",
+                        (time.monotonic() - decode_t0) * 1000.0,
+                        len(torch_frames),
+                        os.path.basename(file_path),
+                    )
                 host_array = host_frames.numpy()
                 del decoded_frames, torch_frames, device_frames
                 return host_array
