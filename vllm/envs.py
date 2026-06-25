@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
+    PYNVC_DECODE_TIMING: bool = False
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
     VLLM_TARGET_DEVICE: str = "cuda"
@@ -950,6 +951,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VIDEO_LOADER_BACKEND": lambda: os.getenv(
         "VLLM_VIDEO_LOADER_BACKEND", "opencv"
     ),
+    # Opt-in per-video HW-decode wall-time logging (issue-#365 TTFT attribution).
+    "PYNVC_DECODE_TIMING": lambda: os.getenv("PYNVC_DECODE_TIMING", "0")
+    not in ("0", "", "false", "False"),
     # Media connector implementation.
     # - "http": Default connector that supports fetching media via HTTP.
     #
