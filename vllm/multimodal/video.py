@@ -7,7 +7,7 @@ import threading
 from abc import abstractmethod
 from contextlib import contextmanager, suppress
 from io import BytesIO
-from typing import Any, ClassVar, Literal, NamedTuple, cast
+from typing import Any, ClassVar, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -15,6 +15,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
 from vllm.utils.import_utils import PlaceholderModule, check_torchcodec_available
 from vllm.utils.mem_constants import MiB_bytes
 from vllm.utils.registry import ExtensionManager
@@ -40,6 +41,8 @@ except (ImportError, RuntimeError):
 
 
 logger = init_logger(__name__)
+
+VideoFrames: TypeAlias = npt.NDArray | GPUVideoFrames
 
 
 class VideoLoaderRegistry(ExtensionManager):
@@ -186,7 +189,7 @@ class VideoLoader:
         cls,
         data: bytes,
         **kwargs,
-    ) -> tuple[npt.NDArray, dict[str, Any]]:
+    ) -> tuple[VideoFrames, dict[str, Any]]:
         """Load video frames from bytes and return (frames_array, metadata_dict)."""
         raise NotImplementedError
 
@@ -790,16 +793,66 @@ class PyNvVideoCodecVideoBackendMixin:
                 return host_array
 
     @classmethod
+    def _decode_to_gpu(
+        cls,
+        file_path: str,
+        frame_idx: list[int],
+        nvc,
+        *,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        import torch
+
+        if not frame_idx:
+            return torch.empty(
+                (0, height, width, 3),
+                dtype=torch.uint8,
+                device=f"cuda:{cls._DEVICE_INDEX}",
+            )
+
+        with cls._borrow_decoder_slot() as decoder_slot:
+            stream = decoder_slot.stream
+            with cls._torch_stream_context(stream):
+                decoder = decoder_slot.get_decoder(
+                    file_path, nvc, device_index=cls._DEVICE_INDEX
+                )
+                decoded_frames = decoder.get_batch_frames_by_index(frame_idx)
+                if len(decoded_frames) < len(frame_idx):
+                    logger.warning(
+                        "pynvvideocodec video loading: expected %d frames but got %d.",
+                        len(frame_idx),
+                        len(decoded_frames),
+                    )
+                torch_frames = [torch.from_dlpack(frame) for frame in decoded_frames]
+                if not torch_frames:
+                    return torch.empty(
+                        (0, height, width, 3),
+                        dtype=torch.uint8,
+                        device=f"cuda:{cls._DEVICE_INDEX}",
+                    )
+                device_frames = torch.stack(torch_frames).contiguous()
+                if device_frames.ndim != 4 or device_frames.shape[-1] != 3:
+                    raise ValueError(
+                        "PyNvVideoCodec returned frames with unexpected shape "
+                        f"{tuple(device_frames.shape)}"
+                    )
+                stream.synchronize()
+                del decoded_frames, torch_frames
+                return device_frames
+
+    @classmethod
     def decode_frames_pynvvideocodec(
         cls,
         data: bytes,
         target: VideoTargetMetadata,
         **kwargs,
-    ) -> tuple[npt.NDArray, VideoSourceMetadata, list[int], list[int]]:
+    ) -> tuple[VideoFrames, VideoSourceMetadata, list[int], list[int]]:
         import PyNvVideoCodec as nvc
 
         from vllm.multimodal.gpu_ipc_memory import get_mm_gpu_ipc_pool
 
+        keep_gpu_frames = kwargs.pop("keep_gpu_frames", False)
         temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
         try:
             with os.fdopen(temp_fd, "wb") as temp_file:
@@ -813,7 +866,28 @@ class PyNvVideoCodecVideoBackendMixin:
             )
             raw_frame_bytes = len(frame_idx) * gpu_source.height * gpu_source.width * 3
             pool = get_mm_gpu_ipc_pool()
-            if pool is None or raw_frame_bytes == 0:
+            if keep_gpu_frames:
+                if pool is None and raw_frame_bytes > 0:
+                    raise RuntimeError(
+                        "GPU-resident video decode requires "
+                        "--mm-ipc-gpu-memory-gb to initialize the frontend "
+                        "multimodal GPU memory pool."
+                    )
+                lease = None if pool is None else pool.acquire(raw_frame_bytes)
+                try:
+                    gpu_frames = cls._decode_to_gpu(
+                        temp_path,
+                        frame_idx,
+                        nvc,
+                        height=gpu_source.height,
+                        width=gpu_source.width,
+                    )
+                except Exception:
+                    if lease is not None:
+                        lease.release()
+                    raise
+                frames = GPUVideoFrames(gpu_frames, lease)
+            elif pool is None or raw_frame_bytes == 0:
                 frames = cls._decode_to_pinned_host(temp_path, frame_idx, nvc)
             else:
                 with pool.acquire(raw_frame_bytes):
@@ -822,7 +896,11 @@ class PyNvVideoCodecVideoBackendMixin:
             with suppress(FileNotFoundError):
                 os.unlink(temp_path)
 
-        valid_frame_indices = frame_idx[: int(frames.shape[0])]
+        if isinstance(frames, GPUVideoFrames):
+            frame_count = frames.frames.shape[0]
+        else:
+            frame_count = frames.shape[0]
+        valid_frame_indices = frame_idx[: int(frame_count)]
         return frames, source, frame_idx, valid_frame_indices
 
 
@@ -888,8 +966,9 @@ class VideoBackend(
         backend: Literal["opencv", "pyav", "torchcodec", "pynvvideocodec"] = "opencv",
         num_ffmpeg_threads: int = 0,
         seek_mode: Literal["exact", "approximate"] = "exact",
+        keep_gpu_frames: bool = False,
         **kwargs,
-    ) -> tuple[npt.NDArray, dict[str, Any]]:
+    ) -> tuple[VideoFrames, dict[str, Any]]:
         """Load sampled frames from raw video bytes.
 
         Args:
@@ -914,6 +993,9 @@ class VideoBackend(
                 at the cost of relying on the file's metadata. See
                 https://meta-pytorch.org/torchcodec/stable/generated_examples/decoding/approximate_mode.html
                 for details.
+            keep_gpu_frames: Keep pynvvideocodec-decoded frames as CUDA
+                tensors instead of copying them to CPU. Requires
+                ``backend="pynvvideocodec"``.
 
         Returns:
             Tuple of ``(frames_array, metadata_dict)``.
@@ -921,6 +1003,9 @@ class VideoBackend(
         target = VideoTargetMetadata(
             num_frames=num_frames, fps=fps, max_duration=max_duration
         )
+
+        if keep_gpu_frames and backend != PYNVVIDEOCODEC_VIDEO_BACKEND:
+            raise ValueError("keep_gpu_frames=True requires backend='pynvvideocodec'.")
 
         if backend == "opencv":
             cap = cls.open_video_capture(data)
@@ -980,6 +1065,7 @@ class VideoBackend(
             frames, source, frame_idx, valid = cls.decode_frames_pynvvideocodec(
                 data,
                 target,
+                keep_gpu_frames=keep_gpu_frames,
                 **kwargs,
             )
         else:
@@ -1013,7 +1099,10 @@ class PyNvVideoCodecVideoBackend(VideoBackend):
     the process-local multimodal GPU memory pool before decoding the selected
     frames into VRAM. Decoded frames are copied into pinned host memory before
     the lease is released, so downstream preprocessing continues to receive a
-    CPU ``np.ndarray`` in NHWC RGB format.
+    CPU ``np.ndarray`` in NHWC RGB format by default. When
+    ``keep_gpu_frames=True`` is configured, decoded frames remain as a CUDA
+    ``torch.uint8`` tensor in NHWC RGB format and keep their frontend VRAM lease
+    until preprocessing releases the raw-frame reference.
     """
 
     @classmethod
@@ -1025,7 +1114,7 @@ class PyNvVideoCodecVideoBackend(VideoBackend):
         max_duration: int = 300,
         frame_recovery: bool = False,
         **kwargs,
-    ) -> tuple[npt.NDArray, dict[str, Any]]:
+    ) -> tuple[VideoFrames, dict[str, Any]]:
         kwargs.pop("backend", None)
         return super().load_bytes(
             data,
@@ -1479,6 +1568,11 @@ class GLMGAVideoBackend(VideoBackend):
             backend=backend,
             **kwargs,
         )
+        if isinstance(frames, GPUVideoFrames):
+            raise ValueError(
+                f"{cls.__name__} does not support keep_gpu_frames=True because "
+                "it requires CPU numpy frame padding."
+            )
         # Ensure even frame count — matches HF's sample_frames even-padding
         # and _preprocess temporal_patch_size divisibility check.
         if frames.shape[0] & 1:

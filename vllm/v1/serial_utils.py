@@ -265,6 +265,12 @@ class MsgpackEncoder:
         elif oob_consumer is not None and (data := oob_consumer(obj)) is not None:
             assert isinstance(data, dict)
         else:
+            if not obj.is_cpu:
+                raise RuntimeError(
+                    "CUDA tensor serialization requires successful out-of-band "
+                    "tensor IPC. Use --mm-tensor-ipc torch_shm and ensure the "
+                    "tensor IPC queue is available."
+                )
             # Otherwise encode index of backing buffer to avoid copy.
             assert self.aux_buffers is not None
             data = len(self.aux_buffers)

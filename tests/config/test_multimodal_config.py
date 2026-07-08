@@ -3,6 +3,7 @@
 
 import pytest
 
+import vllm.platforms as platforms
 from vllm.config.model import ModelConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -59,3 +60,103 @@ def test_mm_encoder_attn_dtype_hash_updates(tmp_path):
     ).compute_hash()
     assert base_hash != fp8_hash
     assert fp8_hash != fp8_static_hash
+
+
+def _set_cuda_platform(monkeypatch: pytest.MonkeyPatch, is_cuda: bool) -> None:
+    monkeypatch.setattr(
+        platforms,
+        "current_platform",
+        type("Platform", (), {"is_cuda": staticmethod(lambda: is_cuda)})(),
+    )
+
+
+def test_keep_gpu_frames_config_is_valid_with_required_options(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _set_cuda_platform(monkeypatch, True)
+
+    config = MultiModalConfig(
+        media_io_kwargs={
+            "video": {
+                "backend": "pynvvideocodec",
+                "keep_gpu_frames": True,
+            }
+        },
+        mm_tensor_ipc="torch_shm",
+        mm_ipc_gpu_memory_gb=1,
+    )
+
+    assert config.media_io_kwargs["video"]["keep_gpu_frames"] is True
+
+
+def test_keep_gpu_frames_config_requires_pynvvideocodec(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _set_cuda_platform(monkeypatch, True)
+
+    with pytest.raises(ValueError, match="backend']='pynvvideocodec"):
+        MultiModalConfig(
+            media_io_kwargs={"video": {"backend": "opencv", "keep_gpu_frames": True}},
+            mm_tensor_ipc="torch_shm",
+            mm_ipc_gpu_memory_gb=1,
+        )
+
+
+def test_keep_gpu_frames_config_requires_cuda(monkeypatch: pytest.MonkeyPatch):
+    _set_cuda_platform(monkeypatch, False)
+
+    with pytest.raises(ValueError, match="CUDA-only"):
+        MultiModalConfig(
+            media_io_kwargs={
+                "video": {
+                    "backend": "pynvvideocodec",
+                    "keep_gpu_frames": True,
+                }
+            },
+            mm_tensor_ipc="torch_shm",
+            mm_ipc_gpu_memory_gb=1,
+        )
+
+
+def test_keep_gpu_frames_config_requires_torch_shm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _set_cuda_platform(monkeypatch, True)
+
+    with pytest.raises(ValueError, match="--mm-tensor-ipc torch_shm"):
+        MultiModalConfig(
+            media_io_kwargs={
+                "video": {
+                    "backend": "pynvvideocodec",
+                    "keep_gpu_frames": True,
+                }
+            },
+            mm_tensor_ipc="direct_rpc",
+            mm_ipc_gpu_memory_gb=1,
+        )
+
+
+def test_keep_gpu_frames_config_requires_gpu_memory_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _set_cuda_platform(monkeypatch, True)
+
+    with pytest.raises(ValueError, match="--mm-ipc-gpu-memory-gb"):
+        MultiModalConfig(
+            media_io_kwargs={
+                "video": {
+                    "backend": "pynvvideocodec",
+                    "keep_gpu_frames": True,
+                }
+            },
+            mm_tensor_ipc="torch_shm",
+        )
+
+
+def test_gpu_video_preprocessing_profile_bytes_do_not_affect_hash():
+    base_hash = MultiModalConfig().compute_hash()
+    profiled_hash = MultiModalConfig(
+        mm_gpu_video_preprocessing_bytes_per_frame=1024
+    ).compute_hash()
+
+    assert profiled_hash == base_hash

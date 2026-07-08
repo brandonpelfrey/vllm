@@ -12,14 +12,14 @@ from PIL import Image
 from vllm import envs
 from vllm.logger import init_logger
 
-from ..video import VIDEO_LOADER_REGISTRY
+from ..video import VIDEO_LOADER_REGISTRY, VideoFrames
 from .base import MediaIO
 from .image import ImageMediaIO
 
 logger = init_logger(__name__)
 
 
-class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
+class VideoMediaIO(MediaIO[tuple[VideoFrames, dict[str, Any]]]):
     """Configuration values can be user-provided either by --media-io-kwargs or
     by the runtime API field "media_io_kwargs". Ensure proper validation and
     error handling.
@@ -32,6 +32,13 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
         runtime_kwargs: dict[str, Any] | None,
     ) -> dict[str, Any]:
         if runtime_kwargs:
+            if runtime_kwargs.get("keep_gpu_frames") and not (default_kwargs or {}).get(
+                "keep_gpu_frames"
+            ):
+                raise ValueError(
+                    "Request-level media_io_kwargs['video']['keep_gpu_frames'] "
+                    "requires keep_gpu_frames to be configured at engine startup."
+                )
             # Block request-level selection of GPU video backends that
             # were not configured (and VRAM-reserved) at startup.
             for key in ("video_backend", "backend"):
@@ -87,14 +94,14 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
         self.kwargs = kwargs
         self.video_loader = VIDEO_LOADER_REGISTRY.load(video_loader_backend)
 
-    def load_bytes(self, data: bytes) -> tuple[npt.NDArray, dict[str, Any]]:
+    def load_bytes(self, data: bytes) -> tuple[VideoFrames, dict[str, Any]]:
         return self.video_loader.load_bytes(
             data, num_frames=self.num_frames, **self.kwargs
         )
 
     def load_base64(
         self, media_type: str, data: str
-    ) -> tuple[npt.NDArray, dict[str, Any]]:
+    ) -> tuple[VideoFrames, dict[str, Any]]:
         if media_type.lower() == "video/jpeg":
             load_frame = partial(
                 self.image_io.load_base64,
@@ -160,7 +167,7 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
 
         return self.load_bytes(pybase64.b64decode(data))
 
-    def load_file(self, filepath: Path) -> tuple[npt.NDArray, dict[str, Any]]:
+    def load_file(self, filepath: Path) -> tuple[VideoFrames, dict[str, Any]]:
         with filepath.open("rb") as f:
             data = f.read()
 

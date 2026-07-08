@@ -110,7 +110,12 @@ class MultiModalConfig:
     media_io_kwargs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Additional args passed to process media inputs, keyed by modalities.
     For example, to set num_frames for video, set
-    `--media-io-kwargs '{"video": {"num_frames": 40} }'`"""
+    `--media-io-kwargs '{"video": {"num_frames": 40} }'`.
+
+    CUDA-resident video decode can be enabled with
+    `--media-io-kwargs '{"video": {"backend": "pynvvideocodec",
+    "keep_gpu_frames": true} }'`. This requires `--mm-tensor-ipc torch_shm`
+    and a positive `--mm-ipc-gpu-memory-gb` budget."""
     mm_processor_kwargs: dict[str, object] | None = None
     """Arguments to be forwarded to the model's processor for multi-modal data,
     e.g., image processor. Overrides for the multi-modal processor obtained
@@ -207,6 +212,12 @@ class MultiModalConfig:
     byte-counting semaphore of this size before allocating on the device.
 
     Set to `0` (default) to disable frontend GPU multimodal memory gating."""
+    mm_gpu_video_preprocessing_bytes_per_frame: int = Field(default=0, ge=0)
+    """Internal frontend VRAM estimate for GPU video preprocessing per frame.
+
+    This is measured by the GPU worker during startup and copied back to the
+    frontend. It is not user-configurable.
+    """
 
     @field_validator("limit_per_prompt", mode="before")
     @classmethod
@@ -280,6 +291,30 @@ class MultiModalConfig:
                 "'mm_encoder_fp8_scale_save_path' cannot be used with "
                 "'mm_encoder_fp8_scale_path' (saving requires dynamic scaling)."
             )
+
+        video_kwargs = self.media_io_kwargs.get("video", {})
+        if video_kwargs.get("keep_gpu_frames"):
+            from vllm.platforms import current_platform
+
+            if video_kwargs.get("backend") != "pynvvideocodec":
+                raise ValueError(
+                    "media_io_kwargs['video']['keep_gpu_frames'] requires "
+                    "media_io_kwargs['video']['backend']='pynvvideocodec'."
+                )
+            if not current_platform.is_cuda():
+                raise ValueError(
+                    "media_io_kwargs['video']['keep_gpu_frames'] is CUDA-only."
+                )
+            if self.mm_tensor_ipc != "torch_shm":
+                raise ValueError(
+                    "media_io_kwargs['video']['keep_gpu_frames'] requires "
+                    "--mm-tensor-ipc torch_shm."
+                )
+            if self.mm_ipc_gpu_memory_gb <= 0:
+                raise ValueError(
+                    "media_io_kwargs['video']['keep_gpu_frames'] requires a "
+                    "positive --mm-ipc-gpu-memory-gb budget."
+                )
 
         # Validate file paths exist.
         if self.mm_encoder_fp8_scale_path is not None:

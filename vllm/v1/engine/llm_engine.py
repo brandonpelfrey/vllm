@@ -19,6 +19,7 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.multimodal.gpu_ipc_memory import MultiModalGPURequestLeaseRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
@@ -89,6 +90,7 @@ class LLMEngine:
         self.should_execute_dummy_batch = False
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
+        self.mm_gpu_lease_registry = MultiModalGPURequestLeaseRegistry()
 
         # Convert EngineInput --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
@@ -99,6 +101,7 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            mm_gpu_lease_registry=self.mm_gpu_lease_registry,
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
@@ -261,6 +264,9 @@ class LLMEngine:
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         self.input_processor.assign_request_id(request)
+        mm_gpu_lease_group = self.input_processor.pop_pending_mm_gpu_request_lease(
+            request.external_req_id
+        )
 
         req_id = request.request_id
 
@@ -270,26 +276,46 @@ class LLMEngine:
         n = params.n if isinstance(params, SamplingParams) else 1
 
         if n == 1:
-            # Make a new RequestState and queue.
-            self.output_processor.add_request(request, prompt_text, None, 0)
-            # Add the request to EngineCore.
-            self.engine_core.add_request(request)
+            try:
+                # Make a new RequestState and queue.
+                self.output_processor.add_request(request, prompt_text, None, 0)
+                self.output_processor.register_mm_gpu_request_lease(
+                    [request.request_id], mm_gpu_lease_group
+                )
+                # Add the request to EngineCore.
+                self.engine_core.add_request(request)
+            except Exception:
+                if mm_gpu_lease_group is not None:
+                    self.output_processor.release_mm_gpu_request_lease(
+                        request.request_id
+                    )
+                    mm_gpu_lease_group.release_all()
+                raise
             return req_id
 
         # Fan out child requests (for n>1).
         parent_req = ParentRequest(request)
-        for idx in range(n):
-            request_id, child_params = parent_req.get_child_info(idx)
-            child_request = request if idx == n - 1 else copy(request)
-            child_request.request_id = request_id
-            child_request.sampling_params = child_params
+        registered_request_ids: list[str] = []
+        try:
+            for idx in range(n):
+                request_id, child_params = parent_req.get_child_info(idx)
+                child_request = request if idx == n - 1 else copy(request)
+                child_request.request_id = request_id
+                child_request.sampling_params = child_params
 
-            # Make a new RequestState and queue.
-            self.output_processor.add_request(
-                child_request, prompt_text, parent_req, idx
-            )
-            # Add the request to EngineCore.
-            self.engine_core.add_request(child_request)
+                # Make a new RequestState and queue.
+                self.output_processor.add_request(
+                    child_request, prompt_text, parent_req, idx
+                )
+                self.output_processor.register_mm_gpu_request_lease(
+                    [child_request.request_id], mm_gpu_lease_group
+                )
+                registered_request_ids.append(child_request.request_id)
+                # Add the request to EngineCore.
+                self.engine_core.add_request(child_request)
+        except Exception:
+            self.mm_gpu_lease_registry.release_all(registered_request_ids)
+            raise
 
         return req_id
 

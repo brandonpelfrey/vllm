@@ -217,6 +217,10 @@ class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
         return True
 
     @property
+    def supports_gpu_video_preprocessing(self) -> bool:
+        return True
+
+    @property
     def supports_audio(self) -> bool:
         return self.sound_config is not None
 

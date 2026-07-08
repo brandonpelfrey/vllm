@@ -3,7 +3,7 @@
 
 import time
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -18,6 +18,9 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.multimodal.gpu_ipc_memory import (
+    MultiModalGPURequestLeaseGroup,
+)
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
@@ -71,6 +74,9 @@ class InputProcessor:
             renderer=renderer,
             mm_registry=mm_registry,
         )
+        self._pending_mm_gpu_request_leases: dict[
+            str, MultiModalGPURequestLeaseGroup
+        ] = {}
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -239,6 +245,56 @@ class InputProcessor:
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
 
+    @staticmethod
+    def _pop_mm_gpu_request_lease(
+        processed_inputs: EngineInput,
+    ) -> MultiModalGPURequestLeaseGroup | None:
+        if processed_inputs["type"] == "enc_dec":
+            encoder_inputs = processed_inputs["encoder_prompt"]
+            decoder_inputs = processed_inputs["decoder_prompt"]
+            lease_group = None
+            if encoder_inputs["type"] == "multimodal":
+                lease_group = cast(
+                    MultiModalGPURequestLeaseGroup | None,
+                    encoder_inputs.pop("_mm_gpu_request_lease", None),
+                )
+            if decoder_inputs["type"] == "multimodal":
+                decoder_lease_group = cast(
+                    MultiModalGPURequestLeaseGroup | None,
+                    decoder_inputs.pop("_mm_gpu_request_lease", None),
+                )
+                lease_group = MultiModalGPURequestLeaseGroup.merge(
+                    [lease_group, decoder_lease_group]
+                )
+            return lease_group
+
+        if processed_inputs["type"] == "multimodal":
+            return cast(
+                MultiModalGPURequestLeaseGroup | None,
+                processed_inputs.pop("_mm_gpu_request_lease", None),
+            )
+        return None
+
+    def pop_pending_mm_gpu_request_lease(
+        self,
+        external_req_id: str | None,
+    ) -> MultiModalGPURequestLeaseGroup | None:
+        if external_req_id is None:
+            return None
+        return self._pending_mm_gpu_request_leases.pop(external_req_id, None)
+
+    def _store_pending_mm_gpu_request_lease(
+        self,
+        external_req_id: str,
+        lease_group: MultiModalGPURequestLeaseGroup | None,
+    ) -> None:
+        if lease_group is None:
+            return
+        old_group = self._pending_mm_gpu_request_leases.pop(external_req_id, None)
+        if old_group is not None:
+            old_group.release_all()
+        self._pending_mm_gpu_request_leases[external_req_id] = lease_group
+
     def process_inputs(
         self,
         request_id: str,
@@ -255,6 +311,7 @@ class InputProcessor:
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        mm_gpu_lease_group: MultiModalGPURequestLeaseGroup | None = None
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -293,96 +350,108 @@ class InputProcessor:
                 tokenization_kwargs=tokenization_kwargs,
             )
 
-        current_platform.validate_request(processed_inputs, params)
+        mm_gpu_lease_group = self._pop_mm_gpu_request_lease(processed_inputs)
+        try:
+            current_platform.validate_request(processed_inputs, params)
 
-        encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
-        self._validate_model_inputs(encoder_inputs, decoder_inputs)
+            encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
+            self._validate_model_inputs(encoder_inputs, decoder_inputs)
 
-        # Mypy can be conservative for TypedDict unions; normalize access.
-        if decoder_inputs["type"] == "embeds":
-            prompt_embeds = decoder_inputs["prompt_embeds"]
-            prompt_token_ids = decoder_inputs.get("prompt_token_ids")
-            prompt_is_token_ids = decoder_inputs.get("is_token_ids")
-        else:
-            prompt_token_ids = decoder_inputs["prompt_token_ids"]
-            prompt_embeds = None
-            prompt_is_token_ids = None
+            # Mypy can be conservative for TypedDict unions; normalize access.
+            if decoder_inputs["type"] == "embeds":
+                prompt_embeds = decoder_inputs["prompt_embeds"]
+                prompt_token_ids = decoder_inputs.get("prompt_token_ids")
+                prompt_is_token_ids = decoder_inputs.get("is_token_ids")
+            else:
+                prompt_token_ids = decoder_inputs["prompt_token_ids"]
+                prompt_embeds = None
+                prompt_is_token_ids = None
 
-        sampling_params = None
-        pooling_params = None
-        if isinstance(params, SamplingParams):
-            # TODO: can we avoid cloning here in multiproc case?
-            sampling_params = params.clone()
-            # If unset max tokens, then generate up to the max_model_len.
-            if sampling_params.max_tokens is None:
-                seq_len = length_from_prompt_token_ids_or_embeds(
-                    prompt_token_ids, prompt_embeds
-                )
-                sampling_params.max_tokens = self.model_config.max_model_len - seq_len
-
-            sampling_params.update_from_generation_config(
-                self.generation_config_fields,
-                self.renderer.get_eos_token_id(),
-            )
-            if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(self.tokenizer)
-        else:
-            pooling_params = params.clone()
-
-        # Multimodal related.
-        mm_features: list[MultiModalFeatureSpec] | None = None
-
-        if decoder_inputs["type"] == "multimodal":
-            decoder_mm_inputs = decoder_inputs["mm_kwargs"]
-            decoder_mm_positions = decoder_inputs["mm_placeholders"]
-            decoder_mm_hashes = decoder_inputs["mm_hashes"]
-
-            if not all(
-                isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
-            ):
-                raise ValueError(
-                    f"mm_hashes must contain only strings, got: {decoder_mm_hashes}. "
-                    "This is likely due to an incorrect custom implementation of "
-                    "MultiModalProcessor.apply method."
-                )
-
-            # Merge and flatten multimodal placeholders, hashes and inputs
-            # from dictionaries to lists, and sort them by each item's position
-            # in the input sequence.
-            sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)
-
-            mm_features = []
-            for modality, idx in sorted_mm_idxs:
-                base_mm_hash = decoder_mm_hashes[modality][idx]
-                mm_features.append(
-                    MultiModalFeatureSpec(
-                        data=decoder_mm_inputs[modality][idx],
-                        modality=modality,
-                        identifier=self._get_mm_identifier(
-                            base_mm_hash,
-                            lora_request,
-                        ),
-                        mm_position=decoder_mm_positions[modality][idx],
-                        mm_hash=base_mm_hash,
+            sampling_params = None
+            pooling_params = None
+            if isinstance(params, SamplingParams):
+                # TODO: can we avoid cloning here in multiproc case?
+                sampling_params = params.clone()
+                # If unset max tokens, then generate up to the max_model_len.
+                if sampling_params.max_tokens is None:
+                    seq_len = length_from_prompt_token_ids_or_embeds(
+                        prompt_token_ids, prompt_embeds
                     )
-                )
+                    sampling_params.max_tokens = (
+                        self.model_config.max_model_len - seq_len
+                    )
 
-        return EngineCoreRequest(
-            request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
-            prompt_embeds=prompt_embeds,
-            prompt_is_token_ids=prompt_is_token_ids,
-            mm_features=mm_features,
-            sampling_params=sampling_params,
-            pooling_params=pooling_params,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            cache_salt=decoder_inputs.get("cache_salt"),
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            trace_headers=trace_headers,
-            resumable=resumable,
-        )
+                sampling_params.update_from_generation_config(
+                    self.generation_config_fields,
+                    self.renderer.get_eos_token_id(),
+                )
+                if self.tokenizer is not None:
+                    sampling_params.update_from_tokenizer(self.tokenizer)
+            else:
+                pooling_params = params.clone()
+
+            # Multimodal related.
+            mm_features: list[MultiModalFeatureSpec] | None = None
+
+            if decoder_inputs["type"] == "multimodal":
+                decoder_mm_inputs = decoder_inputs["mm_kwargs"]
+                decoder_mm_positions = decoder_inputs["mm_placeholders"]
+                decoder_mm_hashes = decoder_inputs["mm_hashes"]
+
+                if not all(
+                    isinstance(leaf, str)
+                    for leaf in json_iter_leaves(decoder_mm_hashes)
+                ):
+                    raise ValueError(
+                        f"mm_hashes must contain only strings, got: "
+                        f"{decoder_mm_hashes}. This is likely due to an incorrect "
+                        "custom implementation of MultiModalProcessor.apply method."
+                    )
+
+                # Merge and flatten multimodal placeholders, hashes and inputs
+                # from dictionaries to lists, and sort them by each item's position
+                # in the input sequence.
+                sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)
+
+                mm_features = []
+                for modality, idx in sorted_mm_idxs:
+                    base_mm_hash = decoder_mm_hashes[modality][idx]
+                    mm_features.append(
+                        MultiModalFeatureSpec(
+                            data=decoder_mm_inputs[modality][idx],
+                            modality=modality,
+                            identifier=self._get_mm_identifier(
+                                base_mm_hash,
+                                lora_request,
+                            ),
+                            mm_position=decoder_mm_positions[modality][idx],
+                            mm_hash=base_mm_hash,
+                        )
+                    )
+
+            request = EngineCoreRequest(
+                request_id=request_id,
+                prompt_token_ids=prompt_token_ids,
+                prompt_embeds=prompt_embeds,
+                prompt_is_token_ids=prompt_is_token_ids,
+                mm_features=mm_features,
+                sampling_params=sampling_params,
+                pooling_params=pooling_params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                cache_salt=decoder_inputs.get("cache_salt"),
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                trace_headers=trace_headers,
+                resumable=resumable,
+            )
+            self._store_pending_mm_gpu_request_lease(request_id, mm_gpu_lease_group)
+            mm_gpu_lease_group = None
+            return request
+        except Exception:
+            if mm_gpu_lease_group is not None:
+                mm_gpu_lease_group.release_all()
+            raise
 
     def _validate_prompt_len(
         self,

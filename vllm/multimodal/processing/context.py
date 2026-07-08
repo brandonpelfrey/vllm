@@ -372,6 +372,10 @@ class BaseProcessingInfo:
     def skip_prompt_length_check(self) -> bool:
         return False
 
+    @property
+    def supports_gpu_video_preprocessing(self) -> bool:
+        return False
+
     @abstractmethod
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         """

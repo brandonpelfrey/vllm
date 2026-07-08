@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -8,6 +9,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
+import torch
 from typing_extensions import TypeVar
 
 from vllm.inputs import (
@@ -29,7 +31,13 @@ from vllm.inputs import (
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY as mm_registry
 from vllm.multimodal.cache import BaseMultiModalProcessorCache
-from vllm.multimodal.gpu_ipc_memory import maybe_init_mm_gpu_ipc_pool
+from vllm.multimodal.gpu_ipc_memory import (
+    GPUVideoFrames,
+    MultiModalGPUMemoryLease,
+    MultiModalGPURequestLeaseGroup,
+    get_mm_gpu_ipc_pool,
+    maybe_init_mm_gpu_ipc_pool,
+)
 from vllm.multimodal.parse import (
     MultiModalDataItems,
     MultiModalUUIDItems,
@@ -41,6 +49,7 @@ from vllm.multimodal.registry import MultiModalTimingRegistry
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
+from vllm.utils.mem_constants import MiB_bytes
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
@@ -724,6 +733,121 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return mm_uuid_items
 
+    @staticmethod
+    def _ceil_to_mib(nbytes: int) -> int:
+        if nbytes <= 0:
+            return 0
+        return math.ceil(nbytes / MiB_bytes) * MiB_bytes
+
+    @staticmethod
+    def _release_raw_gpu_video_frames(data: object) -> None:
+        if isinstance(data, GPUVideoFrames):
+            data.release()
+            return
+        if isinstance(data, Mapping):
+            for value in data.values():
+                BaseRenderer._release_raw_gpu_video_frames(value)
+            return
+        if isinstance(data, (list, tuple)):
+            for value in data:
+                BaseRenderer._release_raw_gpu_video_frames(value)
+
+    @staticmethod
+    def _collect_cuda_tensors(data: object) -> list[torch.Tensor]:
+        tensors: list[torch.Tensor] = []
+        if isinstance(data, torch.Tensor):
+            if data.is_cuda:
+                tensors.append(data)
+            return tensors
+        if isinstance(data, Mapping):
+            for value in data.values():
+                tensors.extend(BaseRenderer._collect_cuda_tensors(value))
+            return tensors
+        if isinstance(data, (list, tuple)):
+            for value in data:
+                tensors.extend(BaseRenderer._collect_cuda_tensors(value))
+        return tensors
+
+    @staticmethod
+    def _count_cuda_video_frames(mm_data_items: MultiModalDataItems) -> int:
+        if "video" not in mm_data_items:
+            return 0
+
+        frame_count = 0
+        video_items = mm_data_items["video"]
+        for i in range(video_items.get_count()):
+            video_item = video_items.get(i)
+            video = video_item[0] if isinstance(video_item, tuple) else video_item
+            if isinstance(video, torch.Tensor) and video.is_cuda:
+                frame_count += int(video.shape[0])
+        return frame_count
+
+    @staticmethod
+    def _video_item_is_cuda(video_item: object) -> bool:
+        video = video_item[0] if isinstance(video_item, tuple) else video_item
+        return isinstance(video, torch.Tensor) and video.is_cuda
+
+    @staticmethod
+    def _ensure_gpu_video_uuids(
+        mm_data_items: MultiModalDataItems,
+        mm_uuid_items: MultiModalUUIDItems,
+        mm_req_id: str,
+    ) -> MultiModalUUIDItems:
+        if "video" not in mm_data_items:
+            return mm_uuid_items
+
+        video_items = mm_data_items["video"]
+        video_uuids = list(mm_uuid_items.get("video", [None] * video_items.get_count()))
+        if len(video_uuids) < video_items.get_count():
+            video_uuids.extend([None] * (video_items.get_count() - len(video_uuids)))
+        for i in range(video_items.get_count()):
+            if video_uuids[i] is None and BaseRenderer._video_item_is_cuda(
+                video_items.get(i)
+            ):
+                video_uuids[i] = f"{mm_req_id}-video-{i}"
+        if any(uuid is not None for uuid in video_uuids):
+            mm_uuid_items = dict(mm_uuid_items)
+            mm_uuid_items["video"] = video_uuids
+        return mm_uuid_items
+
+    def _acquire_gpu_video_preprocessing_lease(
+        self,
+        mm_processor: "BaseMultiModalProcessor",
+        mm_data_items: MultiModalDataItems,
+    ) -> MultiModalGPUMemoryLease | None:
+        mm_config = self.model_config.multimodal_config
+        if mm_config is None:
+            return None
+        if not mm_config.media_io_kwargs.get("video", {}).get("keep_gpu_frames"):
+            return None
+
+        frame_count = self._count_cuda_video_frames(mm_data_items)
+        if frame_count == 0:
+            return None
+        if not mm_processor.info.supports_gpu_video_preprocessing:
+            raise ValueError(
+                f"{type(mm_processor.info).__name__} does not support "
+                "GPU-resident video preprocessing. Disable "
+                "media_io_kwargs['video']['keep_gpu_frames'] or use an "
+                "audited processor."
+            )
+
+        bytes_per_frame = mm_config.mm_gpu_video_preprocessing_bytes_per_frame
+        if bytes_per_frame <= 0:
+            raise ValueError(
+                "GPU-resident video preprocessing memory was not profiled. "
+                "Ensure the engine completed GPU worker memory profiling before "
+                "submitting keep_gpu_frames requests."
+            )
+        pool = get_mm_gpu_ipc_pool()
+        if pool is None:
+            raise RuntimeError(
+                "GPU-resident video preprocessing requires "
+                "--mm-ipc-gpu-memory-gb to initialize the frontend multimodal "
+                "GPU memory pool."
+            )
+        return pool.acquire(self._ceil_to_mib(bytes_per_frame * frame_count))
+
     # TODO: Remove str and tokenization_kwargs after deprecating InputPreprocessor
     def _process_multimodal(
         self,
@@ -748,7 +872,13 @@ class BaseRenderer(ABC, Generic[_T]):
         mm_uuid_items = self._process_mm_uuids(
             mm_data, mm_data_items, mm_uuid_items, mm_req_id
         )
+        mm_uuid_items = self._ensure_gpu_video_uuids(
+            mm_data_items, mm_uuid_items, mm_req_id
+        )
 
+        preprocessing_lease = self._acquire_gpu_video_preprocessing_lease(
+            mm_processor, mm_data_items
+        )
         mm_processor_inputs = MMProcessorInputs(
             prompt,
             mm_data_items,
@@ -758,8 +888,27 @@ class BaseRenderer(ABC, Generic[_T]):
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
-        with set_default_torch_num_threads():
-            mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+        try:
+            with set_default_torch_num_threads():
+                mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+
+            if preprocessing_lease is not None:
+                cuda_tensors = self._collect_cuda_tensors(mm_inputs["mm_kwargs"])
+                if not cuda_tensors:
+                    raise RuntimeError(
+                        "GPU-resident video preprocessing did not produce CUDA "
+                        "multimodal tensors. CPU fallback is disabled when "
+                        "keep_gpu_frames is enabled."
+                    )
+                mm_inputs["_mm_gpu_request_lease"] = MultiModalGPURequestLeaseGroup(
+                    lease=preprocessing_lease,
+                    tensors=cuda_tensors,
+                )
+                preprocessing_lease = None
+        finally:
+            if preprocessing_lease is not None:
+                preprocessing_lease.release()
+            self._release_raw_gpu_video_frames(mm_data)
 
         self.update_mm_cache_stats()
 

@@ -11,6 +11,10 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.gpu_ipc_memory import (
+    MultiModalGPURequestLeaseGroup,
+    MultiModalGPURequestLeaseRegistry,
+)
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -424,6 +428,7 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        mm_gpu_lease_registry: MultiModalGPURequestLeaseRegistry | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -433,9 +438,22 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.mm_gpu_lease_registry = (
+            mm_gpu_lease_registry or MultiModalGPURequestLeaseRegistry()
+        )
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
+
+    def register_mm_gpu_request_lease(
+        self,
+        request_ids: list[str],
+        lease_group: MultiModalGPURequestLeaseGroup | None,
+    ) -> None:
+        self.mm_gpu_lease_registry.register(request_ids, lease_group)
+
+    def release_mm_gpu_request_lease(self, request_id: str) -> None:
+        self.mm_gpu_lease_registry.release(request_id)
 
     def has_unfinished_requests(self) -> bool:
         return len(self.request_states) > 0
@@ -446,6 +464,7 @@ class OutputProcessor:
         for _, state in self.request_states.items():
             assert state.queue is not None
             state.queue.put(e)
+        self.mm_gpu_lease_registry.clear()
 
     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
         """Abort a list of requests.
@@ -484,6 +503,7 @@ class OutputProcessor:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
                 self.lora_states.request_finished(request_id, req_state.lora_name)
+                self.release_mm_gpu_request_lease(request_id)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
                 if req_state.queue is not None and (
@@ -695,6 +715,7 @@ class OutputProcessor:
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
         self.request_states.pop(req_id)
+        self.release_mm_gpu_request_lease(req_id)
 
         internal_ids = self.external_req_ids[req_state.external_req_id]
         internal_ids.remove(req_id)

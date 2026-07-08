@@ -83,6 +83,7 @@ class EngineCoreReadyResponse:
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    mm_gpu_video_preprocessing_bytes_per_frame: int = 0
 
 
 class EngineCoreRequest(

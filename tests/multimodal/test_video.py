@@ -10,10 +10,12 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 import pytest
+import torch
 from transformers import AutoVideoProcessor
 from transformers.video_utils import VideoMetadata
 
 from vllm.assets.base import get_vllm_public_assets
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
     PYNVVIDEOCODEC_MAX_RETAINED_DECODERS,
@@ -132,6 +134,100 @@ def test_pynvvideocodec_backend_accounts_raw_decoded_frames(
     assert decoder_cache_sizes == [PYNVVIDEOCODEC_DECODER_CACHE_SIZE]
     assert metadata["video_backend"] == PYNVVIDEOCODEC_VIDEO_BACKEND
     assert metadata["frames_indices"] == [0, 3, 6, 9]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_pynvvideocodec_keep_gpu_frames_avoids_cpu_copy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeMetadata:
+        width = 10
+        height = 20
+        average_fps = 5.0
+        duration = 2.0
+
+    class FakeDecoder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __len__(self):
+            return 10
+
+        def get_stream_metadata(self):
+            return FakeMetadata()
+
+    class FakeNvc:
+        class OutputColorType:
+            RGB = "rgb"
+
+        SimpleDecoder = FakeDecoder
+
+    class RecordingLease:
+        def __init__(self, size: int):
+            self.size = size
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    class RecordingPool:
+        def __init__(self):
+            self.leases: list[RecordingLease] = []
+
+        def acquire(self, size: int):
+            lease = RecordingLease(size)
+            self.leases.append(lease)
+            return lease
+
+    def fake_decode_to_gpu(
+        cls,
+        file_path: str,
+        frame_idx: list[int],
+        nvc,
+        *,
+        height: int,
+        width: int,
+    ):
+        return torch.empty(
+            (len(frame_idx), height, width, 3),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+
+    def fail_cpu_decode(cls, file_path: str, frame_idx: list[int], nvc):
+        raise AssertionError("keep_gpu_frames should not copy frames to CPU")
+
+    pool = RecordingPool()
+    monkeypatch.setitem(sys.modules, "PyNvVideoCodec", FakeNvc)
+    monkeypatch.setattr(
+        "vllm.multimodal.gpu_ipc_memory.get_mm_gpu_ipc_pool", lambda: pool
+    )
+    monkeypatch.setattr(
+        PyNvVideoCodecVideoBackend, "_decode_to_gpu", classmethod(fake_decode_to_gpu)
+    )
+    monkeypatch.setattr(
+        PyNvVideoCodecVideoBackend,
+        "_decode_to_pinned_host",
+        classmethod(fail_cpu_decode),
+    )
+
+    loader = VIDEO_LOADER_REGISTRY.load(PYNVVIDEOCODEC_VIDEO_BACKEND)
+    frames, metadata = loader.load_bytes(
+        b"fake video",
+        num_frames=4,
+        keep_gpu_frames=True,
+    )
+
+    assert isinstance(frames, GPUVideoFrames)
+    assert frames.frames.is_cuda
+    assert frames.frames.dtype == torch.uint8
+    assert frames.frames.shape == (4, 20, 10, 3)
+    assert pool.leases[0].size == 4 * 20 * 10 * 3
+    assert metadata["frames_indices"] == [0, 3, 6, 9]
+
+    assert not pool.leases[0].released
+    frames.release()
+    assert pool.leases[0].released
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

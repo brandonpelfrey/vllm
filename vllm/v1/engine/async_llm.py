@@ -25,6 +25,10 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.multimodal.gpu_ipc_memory import (
+    MultiModalGPURequestLeaseGroup,
+    MultiModalGPURequestLeaseRegistry,
+)
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
@@ -130,6 +134,7 @@ class AsyncLLM(EngineClient):
             )
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
+        self.mm_gpu_lease_registry = MultiModalGPURequestLeaseRegistry()
 
         # Convert EngineInput --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
@@ -140,6 +145,7 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            mm_gpu_lease_registry=self.mm_gpu_lease_registry,
         )
 
         # EngineCore (starts the engine in background process).
@@ -366,6 +372,9 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        mm_gpu_lease_group = self.input_processor.pop_pending_mm_gpu_request_lease(
+            request.external_req_id
+        )
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
@@ -379,7 +388,14 @@ class AsyncLLM(EngineClient):
         params = request.params
 
         if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+            await self._add_request(
+                request,
+                prompt_text,
+                None,
+                0,
+                queue,
+                mm_gpu_lease_group=mm_gpu_lease_group,
+            )
             return queue
 
         parent_params = params
@@ -393,7 +409,12 @@ class AsyncLLM(EngineClient):
             child_request.request_id = request_id
             child_request.sampling_params = child_params
             await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
+                child_request,
+                prompt_text,
+                parent_request,
+                idx,
+                queue,
+                mm_gpu_lease_group=mm_gpu_lease_group,
             )
         return queue
 
@@ -404,12 +425,20 @@ class AsyncLLM(EngineClient):
         parent_req: ParentRequest | None,
         index: int,
         queue: RequestOutputCollector,
+        mm_gpu_lease_group: MultiModalGPURequestLeaseGroup | None = None,
     ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
-        # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        try:
+            self.output_processor.register_mm_gpu_request_lease(
+                [request.request_id], mm_gpu_lease_group
+            )
+            # Add the EngineCoreRequest to EngineCore (separate process).
+            await self.engine_core.add_request_async(request)
+        except Exception:
+            self.output_processor.release_mm_gpu_request_lease(request.request_id)
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)

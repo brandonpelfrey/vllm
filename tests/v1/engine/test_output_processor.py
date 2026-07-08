@@ -16,6 +16,10 @@ from tests.v1.engine.utils import (
 from vllm import PoolingParams
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.gpu_ipc_memory import (
+    MultiModalGPUMemoryPool,
+    MultiModalGPURequestLeaseGroup,
+)
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -44,6 +48,18 @@ def _ref_convert_id_to_token(
       String representation of input token id
     """
     return tokenizer.decode([token_id]) or ""
+
+
+def test_output_processor_releases_mm_gpu_request_lease():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    lease_group = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    output_processor = OutputProcessor(None, log_stats=False)
+
+    output_processor.register_mm_gpu_request_lease(["request-0"], lease_group)
+    assert pool.available_bytes == 60
+
+    output_processor.release_mm_gpu_request_lease("request-0")
+    assert pool.available_bytes == 100
 
 
 @pytest.mark.parametrize(

@@ -25,6 +25,7 @@ from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
 
+from .gpu_ipc_memory import GPUVideoFrames
 from .media import MediaWithBytes
 
 if TYPE_CHECKING:
@@ -66,7 +67,10 @@ these are directly passed to the model without HF processing.
 """
 
 VideoItem: TypeAlias = Union[
-    HfVideoItem, "torch.Tensor", tuple[HfVideoItem, dict[str, Any]]
+    HfVideoItem,
+    GPUVideoFrames,
+    "torch.Tensor",
+    tuple[HfVideoItem | GPUVideoFrames, dict[str, Any]],
 ]
 """
 A `transformers.video_utils.VideoInput` representing a single video item. 

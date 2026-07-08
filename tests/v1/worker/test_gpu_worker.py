@@ -37,10 +37,21 @@ def _mm_config(
     *,
     mm_ipc_gpu_memory_gb: float = 0,
     video_backend: str | None = None,
+    keep_gpu_frames: bool = False,
 ) -> SimpleNamespace:
-    video_kwargs = {} if video_backend is None else {"video_backend": video_backend}
+    video_kwargs: dict[str, object] = (
+        {} if video_backend is None else {"video_backend": video_backend}
+    )
+    if keep_gpu_frames:
+        video_kwargs.update(
+            {
+                "backend": PYNVVIDEOCODEC_VIDEO_BACKEND,
+                "keep_gpu_frames": True,
+            }
+        )
     return SimpleNamespace(
         mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,
+        mm_gpu_video_preprocessing_bytes_per_frame=0,
         media_io_kwargs={"video": video_kwargs} if video_kwargs else {},
     )
 
@@ -120,6 +131,18 @@ def test_reserve_mm_ipc_gpu_memory_scales_pynvvideocodec_budget_by_api_servers(
     assert worker._reserve_mm_ipc_gpu_memory(available_bytes) == (
         available_bytes - _pynvvideocodec_decoder_budget(api_process_count=3)
     )
+
+
+def test_profile_mm_gpu_video_preprocessing_memory_stores_profiled_bytes():
+    mm_config = _mm_config(keep_gpu_frames=True)
+    worker = _worker_with_mm_config(mm_config)
+    worker.model_runner = SimpleNamespace(
+        profile_gpu_video_preprocessing_memory=lambda: 123456
+    )
+
+    assert worker._profile_mm_gpu_video_preprocessing_memory() == 123456
+    assert worker.mm_gpu_video_preprocessing_bytes_per_frame == 123456
+    assert mm_config.mm_gpu_video_preprocessing_bytes_per_frame == 123456
 
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and

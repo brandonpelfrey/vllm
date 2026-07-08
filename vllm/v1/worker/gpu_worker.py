@@ -449,6 +449,7 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            self._profile_mm_gpu_video_preprocessing_memory()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -585,9 +586,26 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        self._profile_mm_gpu_video_preprocessing_memory()
         return self._reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes)
         )
+
+    def _profile_mm_gpu_video_preprocessing_memory(self) -> int:
+        bytes_per_frame = self.model_runner.profile_gpu_video_preprocessing_memory()
+        self.mm_gpu_video_preprocessing_bytes_per_frame = bytes_per_frame
+        mm_config = self.model_config.multimodal_config
+        if mm_config is not None:
+            mm_config.mm_gpu_video_preprocessing_bytes_per_frame = bytes_per_frame
+        if bytes_per_frame > 0:
+            logger.info_once(
+                "Profiled GPU video preprocessing memory: %s GiB per frame.",
+                format_gib(bytes_per_frame),
+            )
+        return bytes_per_frame
+
+    def get_mm_gpu_video_preprocessing_bytes_per_frame(self) -> int:
+        return getattr(self, "mm_gpu_video_preprocessing_bytes_per_frame", 0)
 
     @staticmethod
     def _uses_gpu_video_backend(mm_config) -> bool:

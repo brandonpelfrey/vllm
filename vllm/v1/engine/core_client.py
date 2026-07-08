@@ -743,6 +743,12 @@ class MPClient(EngineCoreClient):
             if getattr(cache_config, "kv_cache_max_concurrency", None) is not None
             else response.kv_cache_max_concurrency
         )
+        mm_config = getattr(vllm_config.model_config, "multimodal_config", None)
+        if mm_config is not None:
+            mm_config.mm_gpu_video_preprocessing_bytes_per_frame = max(
+                mm_config.mm_gpu_video_preprocessing_bytes_per_frame,
+                response.mm_gpu_video_preprocessing_bytes_per_frame,
+            )
 
         # In external DP LB mode, the coordinator address that the
         # front-end procs connect to is obtained by each engine via it's

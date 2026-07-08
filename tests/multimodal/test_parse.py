@@ -5,7 +5,12 @@ import pytest
 import torch
 from PIL import Image
 
-from vllm.multimodal.parse import ImageProcessorItems, VideoProcessorItems
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
+from vllm.multimodal.parse import (
+    ImageProcessorItems,
+    MultiModalDataParser,
+    VideoProcessorItems,
+)
 
 H, W = 480, 640
 
@@ -49,3 +54,27 @@ def test_frame_size_hwc_chw(frame):
     items = VideoProcessorItems([[frame]])
 
     assert items.get_frame_size(0) == (W, H)
+
+
+def test_parser_preserves_gpu_video_frame_wrapper():
+    parser = MultiModalDataParser()
+    frames = torch.zeros((2, H, W, 3), dtype=torch.uint8)
+    metadata = {"frames_indices": [0, 1]}
+
+    parsed_frames, parsed_metadata = parser._get_video_with_metadata(
+        (GPUVideoFrames(frames), metadata)
+    )
+
+    assert parsed_frames is frames
+    assert parsed_metadata is metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_parser_preserves_cuda_video_tensor():
+    parser = MultiModalDataParser()
+    frames = torch.zeros((2, H, W, 3), dtype=torch.uint8, device="cuda")
+
+    parsed_frames, parsed_metadata = parser._get_video_with_metadata(frames)
+
+    assert parsed_frames is frames
+    assert parsed_metadata is None

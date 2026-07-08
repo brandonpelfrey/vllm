@@ -25,6 +25,9 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    _mm_gpu_request_lease: NotRequired[object]
+    """Frontend-only multimodal GPU lease; removed before engine serialization."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

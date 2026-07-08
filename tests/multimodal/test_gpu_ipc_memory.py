@@ -8,6 +8,8 @@ import pytest
 
 from vllm.multimodal.gpu_ipc_memory import (
     MultiModalGPUMemoryPool,
+    MultiModalGPURequestLeaseGroup,
+    MultiModalGPURequestLeaseRegistry,
     get_mm_gpu_ipc_pool,
     maybe_init_mm_gpu_ipc_pool,
     set_mm_gpu_ipc_pool,
@@ -45,8 +47,74 @@ def test_double_release_is_noop():
     lease = pool.acquire(50)
     lease.release()
     assert pool.available_bytes == 100
+
+
+def test_request_lease_registry_releases_on_finish():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    group = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    registry = MultiModalGPURequestLeaseRegistry()
+
+    registry.register(["req"], group)
+    assert pool.available_bytes == 60
+
+    registry.release("req")
+    assert pool.available_bytes == 100
+
+
+def test_request_lease_registry_duplicate_release_is_noop():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    group = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    registry = MultiModalGPURequestLeaseRegistry()
+
+    registry.register(["req"], group)
+    registry.release("req")
+    registry.release("req")
+
+    assert pool.available_bytes == 100
+
+
+def test_request_lease_registry_shared_group_refcount():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    group = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    registry = MultiModalGPURequestLeaseRegistry()
+
+    registry.register(["child-1", "child-2"], group)
+    registry.release("child-1")
+    assert pool.available_bytes == 60
+
+    registry.release("child-2")
+    assert pool.available_bytes == 100
+
+
+def test_request_lease_group_merge_releases_children():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    first = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    second = MultiModalGPURequestLeaseGroup(pool.acquire(30))
+    group = MultiModalGPURequestLeaseGroup.merge([first, second])
+    registry = MultiModalGPURequestLeaseRegistry()
+
+    assert group is not None
+    assert group.nbytes == 70
+    registry.register(["child-1", "child-2"], group)
+
+    registry.release("child-1")
+    assert pool.available_bytes == 30
+
+    registry.release("child-2")
+    assert pool.available_bytes == 100
+
+
+def test_request_lease_registry_clear_releases_all():
+    pool = MultiModalGPUMemoryPool(total_bytes=100)
+    group = MultiModalGPURequestLeaseGroup(pool.acquire(40))
+    registry = MultiModalGPURequestLeaseRegistry()
+
+    registry.register(["child-1", "child-2"], group)
+    registry.clear()
+
+    assert pool.available_bytes == 100
     # Releasing again must not inflate the pool past its capacity.
-    lease.release()
+    group.release_all()
     assert pool.available_bytes == 100
 
 

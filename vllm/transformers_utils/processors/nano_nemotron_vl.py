@@ -215,7 +215,7 @@ def get_video_target_size_and_feature_size(
 
 
 def video_to_pixel_values(
-    video: npt.NDArray,
+    video: npt.NDArray | torch.Tensor,
     *,
     input_size: int,
     video_target_num_patches: int | None = None,
@@ -244,7 +244,12 @@ def video_to_pixel_values(
     elif orig_h != input_size or orig_w != input_size:
         size = (input_size, input_size)
 
-    tensor = torch.from_numpy(video)
+    tensor = video if isinstance(video, torch.Tensor) else torch.from_numpy(video)
+    if tensor.is_cuda:
+        if norm_mean is not None:
+            norm_mean = norm_mean.to(device=tensor.device)
+        if norm_std is not None:
+            norm_std = norm_std.to(device=tensor.device)
     return _bicubic_resize_and_normalize(tensor, size, norm_mean, norm_std, dtype)
 
 
@@ -861,7 +866,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
     def _videos_to_pixel_values_lst(
         self,
-        videos: list[npt.NDArray],
+        videos: list[npt.NDArray | torch.Tensor],
         *,
         dtype: torch.dtype = torch.float32,
     ) -> list[torch.Tensor]:
@@ -883,7 +888,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     def _preprocess_video(
         self,
         text: list[str],
-        videos: list[tuple[npt.NDArray, dict[str, Any]]],
+        videos: list[tuple[npt.NDArray | torch.Tensor, dict[str, Any]]],
     ) -> tuple[list[str], dict[str, Any]]:
         if len(videos) == 0 or not self.supports_video:
             return text, {}

@@ -17,11 +17,18 @@ amount out of its KV-cache budget so the headroom physically exists.
 """
 
 import threading
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.utils.mem_constants import GiB_bytes
 
+if TYPE_CHECKING:
+    import torch
+
 logger = init_logger(__name__)
+
+MM_GPU_REQUEST_LEASE_KEY = "_mm_gpu_request_lease"
 
 
 class MultiModalGPUMemoryLease:
@@ -44,6 +51,129 @@ class MultiModalGPUMemoryLease:
 
     def __exit__(self, *exc_info) -> None:
         self.release()
+
+
+@dataclass
+class GPUVideoFrames:
+    """CUDA-resident raw decoded video frames and their VRAM lease."""
+
+    frames: "torch.Tensor"
+    lease: MultiModalGPUMemoryLease | None = None
+
+    def release(self) -> None:
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+
+
+@dataclass
+class MultiModalGPURequestLeaseGroup:
+    """Refcounted frontend GPU lease for processed multimodal tensors."""
+
+    lease: MultiModalGPUMemoryLease | None
+    tensors: list["torch.Tensor"] = field(default_factory=list)
+    child_groups: list["MultiModalGPURequestLeaseGroup"] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _ref_count: int = 0
+    _released: bool = False
+
+    @property
+    def nbytes(self) -> int:
+        lease_nbytes = 0 if self.lease is None else self.lease.nbytes
+        return lease_nbytes + sum(group.nbytes for group in self.child_groups)
+
+    @classmethod
+    def merge(
+        cls,
+        lease_groups: list["MultiModalGPURequestLeaseGroup | None"],
+    ) -> "MultiModalGPURequestLeaseGroup | None":
+        groups = [group for group in lease_groups if group is not None]
+        if not groups:
+            return None
+        if len(groups) == 1:
+            return groups[0]
+        return cls(lease=None, child_groups=groups)
+
+    def add_ref(self) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("Cannot add a reference to a released lease group")
+            self._ref_count += 1
+
+    def release_ref(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            if self._ref_count > 0:
+                self._ref_count -= 1
+            if self._ref_count == 0:
+                self._release_locked()
+
+    def release_all(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._ref_count = 0
+            self._release_locked()
+
+    def _release_locked(self) -> None:
+        self._released = True
+        self.tensors.clear()
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+        for child_group in self.child_groups:
+            child_group.release_all()
+        self.child_groups.clear()
+
+
+class MultiModalGPURequestLeaseRegistry:
+    """Tracks processed multimodal GPU leases by frontend request ID."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._request_leases: dict[str, MultiModalGPURequestLeaseGroup] = {}
+
+    def register(
+        self,
+        request_ids: list[str],
+        lease_group: MultiModalGPURequestLeaseGroup | None,
+    ) -> None:
+        if lease_group is None:
+            return
+
+        registered_ids: list[str] = []
+        with self._lock:
+            try:
+                for request_id in request_ids:
+                    old_group = self._request_leases.pop(request_id, None)
+                    if old_group is not None:
+                        old_group.release_ref()
+                    lease_group.add_ref()
+                    self._request_leases[request_id] = lease_group
+                    registered_ids.append(request_id)
+            except Exception:
+                for request_id in registered_ids:
+                    self._request_leases.pop(request_id, None)
+                    lease_group.release_ref()
+                raise
+
+    def release(self, request_id: str) -> None:
+        with self._lock:
+            lease_group = self._request_leases.pop(request_id, None)
+        if lease_group is not None:
+            lease_group.release_ref()
+
+    def release_all(self, request_ids: list[str]) -> None:
+        for request_id in request_ids:
+            self.release(request_id)
+
+    def clear(self) -> None:
+        with self._lock:
+            lease_groups = list(self._request_leases.values())
+            self._request_leases.clear()
+        for lease_group in lease_groups:
+            lease_group.release_all()
 
 
 class MultiModalGPUMemoryPool:

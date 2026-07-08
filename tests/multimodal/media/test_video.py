@@ -404,6 +404,25 @@ class TestMergeKwargsGpuBackendPolicy:
         )
         assert result["backend"] == "pynvvideocodec"
 
+    def test_keep_gpu_frames_requires_static_opt_in(self):
+        with pytest.raises(ValueError, match="configured at engine startup"):
+            VideoMediaIO.merge_kwargs(
+                default_kwargs={"backend": "pynvvideocodec"},
+                runtime_kwargs={"keep_gpu_frames": True},
+            )
+
+    def test_keep_gpu_frames_runtime_override_allowed_when_static(self):
+        result = VideoMediaIO.merge_kwargs(
+            default_kwargs={
+                "backend": "pynvvideocodec",
+                "keep_gpu_frames": True,
+            },
+            runtime_kwargs={"keep_gpu_frames": True, "num_frames": 4},
+        )
+
+        assert result["keep_gpu_frames"] is True
+        assert result["num_frames"] == 4
+
     @pytest.mark.parametrize("backend", ["opencv", "pyav", "torchcodec"])
     def test_software_video_backend_passes_through(self, backend: str):
         result = VideoMediaIO.merge_kwargs(

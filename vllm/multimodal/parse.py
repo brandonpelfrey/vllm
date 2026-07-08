@@ -20,6 +20,7 @@ import torch
 from typing_extensions import assert_never
 
 from vllm.inputs import ModalityData, MultiModalDataDict, MultiModalUUIDDict
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import LazyLoader
 
@@ -552,14 +553,23 @@ class MultiModalDataParser:
     def _get_video_with_metadata(
         self,
         video: VideoItem,
-    ) -> tuple[np.ndarray, dict[str, Any] | None]:
+    ) -> tuple[np.ndarray | torch.Tensor, dict[str, Any] | None]:
         if isinstance(video, tuple):
+            frames, metadata = video
+            if isinstance(frames, GPUVideoFrames):
+                return frames.frames, metadata
+            if isinstance(frames, torch.Tensor) and frames.is_cuda:
+                return frames, metadata
             return video
         if isinstance(video, list):
             return np.array(video), None
         if isinstance(video, np.ndarray):
             return video, None
+        if isinstance(video, GPUVideoFrames):
+            return video.frames, None
         if isinstance(video, torch.Tensor):
+            if video.is_cuda:
+                return video, None
             return video.numpy(), None
 
         assert_never(video)
@@ -653,7 +663,7 @@ class MultiModalDataParser:
         else:
             data_items = data  # type: ignore[assignment]
 
-        new_videos = list[tuple[np.ndarray, dict[str, Any] | None]]()
+        new_videos: list[Any] = []
         metadata_lst: list[dict[str, Any] | None] = []
         for data_item in data_items:
             video, metadata = self._get_video_with_metadata(data_item)

@@ -269,6 +269,7 @@ class EngineCore:
                 vllm_config.cache_config.enable_prefix_caching = False
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
+        mm_gpu_video_preprocessing_bytes_per_frame = 0
         if has_kv_cache:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
                 # NOTE(yongji): should already be set
@@ -282,6 +283,18 @@ class EngineCore:
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+                mm_config = vllm_config.model_config.multimodal_config
+                if mm_config is not None and mm_config.media_io_kwargs.get(
+                    "video", {}
+                ).get("keep_gpu_frames"):
+                    mm_gpu_video_preprocessing_bytes_per_frame = max(
+                        self.model_executor.collective_rpc(
+                            "get_mm_gpu_video_preprocessing_bytes_per_frame"
+                        )
+                    )
+                    mm_config.mm_gpu_video_preprocessing_bytes_per_frame = (
+                        mm_gpu_video_preprocessing_bytes_per_frame
+                    )
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -1522,6 +1535,12 @@ class EngineCoreProc(EngineCore):
 
             # Register sockets with poller.
             poller = zmq.Poller()
+            mm_config = self.vllm_config.model_config.multimodal_config
+            mm_gpu_video_preprocessing_bytes_per_frame = (
+                0
+                if mm_config is None
+                else mm_config.mm_gpu_video_preprocessing_bytes_per_frame
+            )
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
@@ -1536,6 +1555,9 @@ class EngineCoreProc(EngineCore):
                 ),
                 kv_cache_max_concurrency=(
                     self.vllm_config.cache_config.kv_cache_max_concurrency
+                ),
+                mm_gpu_video_preprocessing_bytes_per_frame=(
+                    mm_gpu_video_preprocessing_bytes_per_frame
                 ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)

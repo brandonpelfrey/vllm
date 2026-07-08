@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.transformers_utils.processors import nano_nemotron_vl as processor_module
 
 
 class _TextOnlyMultiModalConfig:
@@ -64,6 +66,42 @@ class _FakeTensor:
 
     def clone(self):
         return self
+
+
+def test_nano_nemotron_video_preprocessing_accepts_torch_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    video = torch.zeros((2, 4, 4, 3), dtype=torch.uint8)
+    captured = {}
+
+    def fail_from_numpy(_array):
+        raise AssertionError("torch video inputs should not use torch.from_numpy")
+
+    def fake_resize_and_normalize(tensor, size, norm_mean, norm_std, dtype):
+        captured["tensor"] = tensor
+        captured["size"] = size
+        captured["dtype"] = dtype
+        return tensor
+
+    monkeypatch.setattr(torch, "from_numpy", fail_from_numpy)
+    monkeypatch.setattr(
+        processor_module,
+        "_bicubic_resize_and_normalize",
+        fake_resize_and_normalize,
+    )
+
+    output = processor_module.video_to_pixel_values(
+        video,
+        input_size=4,
+        dtype=torch.float16,
+    )
+
+    assert output is video
+    assert captured == {
+        "tensor": video,
+        "size": None,
+        "dtype": torch.float16,
+    }
 
 
 def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():
