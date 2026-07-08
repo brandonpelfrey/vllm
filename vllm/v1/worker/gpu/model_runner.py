@@ -43,6 +43,8 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.parse import VideoProcessorItems
+from vllm.multimodal.processing import TimingContext
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -673,6 +675,82 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def reset_encoder_cache(self) -> None:
         if self.encoder_cache is not None:
             self.encoder_cache.reset_encoder_cache()
+
+    @staticmethod
+    def _allocated_bytes(device: torch.device) -> int:
+        return int(
+            torch.accelerator.memory_stats(device).get("allocated_bytes.all.current", 0)
+        )
+
+    def profile_gpu_video_preprocessing_memory(self) -> int:
+        mm_config = self.model_config.multimodal_config
+        if mm_config is None or not mm_config.media_io_kwargs.get("video", {}).get(
+            "keep_gpu_frames"
+        ):
+            return 0
+        if not self.supports_mm_inputs:
+            return 0
+
+        processor = self.mm_registry.create_processor(self.model_config)
+        if not processor.info.supports_gpu_video_preprocessing:
+            raise ValueError(
+                f"{type(processor.info).__name__} does not support "
+                "GPU-resident video preprocessing. Disable "
+                "media_io_kwargs['video']['keep_gpu_frames'] or use an "
+                "audited processor."
+            )
+
+        processor_inputs = processor.dummy_inputs.get_dummy_processor_inputs(
+            seq_len=self.model_config.max_model_len,
+            mm_counts={"video": 1},
+            mm_options=mm_config.limit_per_prompt,
+        )
+        if "video" not in processor_inputs.mm_data_items:
+            return 0
+
+        video_item = processor_inputs.mm_data_items["video"].get(0)
+        video = video_item[0] if isinstance(video_item, tuple) else video_item
+        metadata = dict(video_item[1]) if isinstance(video_item, tuple) else {}
+        if not isinstance(video, np.ndarray):
+            raise TypeError(
+                "GPU video preprocessing profiling expected dummy video data to "
+                f"be a numpy array, got {type(video).__name__}."
+            )
+
+        _, height, width, channels = video.shape
+        fake_video = torch.empty(
+            (1, height, width, channels),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        metadata.setdefault("fps", 1.0)
+        metadata.setdefault("total_num_frames", 1)
+        metadata.setdefault("duration", 1.0 / max(float(metadata["fps"]), 1.0))
+        metadata["frames_indices"] = [0]
+        metadata["video_backend"] = "gpu_video_preprocessing_profile"
+        processor_inputs.mm_data_items["video"] = VideoProcessorItems(
+            [(fake_video, metadata)],
+            metadata=[metadata],
+        )
+        processor_inputs.mm_uuid_items = {"video": ["gpu-video-profile"]}
+
+        torch.accelerator.synchronize()
+        before = self._allocated_bytes(self.device)
+        torch.accelerator.reset_peak_memory_stats(self.device)
+        mm_inputs = processor.apply(
+            processor_inputs,
+            timing_ctx=TimingContext(enabled=False),
+        )
+        torch.accelerator.synchronize()
+        peak = int(
+            torch.accelerator.memory_stats(self.device).get(
+                "allocated_bytes.all.peak", before
+            )
+        )
+        del mm_inputs, fake_video, processor, processor_inputs
+        gc.collect()
+        torch.accelerator.empty_cache()
+        return max(0, peak - before)
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
         # SP is not supported yet.
