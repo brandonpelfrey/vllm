@@ -2,13 +2,53 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 from packaging.version import Version
 from transformers import __version__ as TRANSFORMERS_VERSION
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
+from vllm.renderers.base import BaseRenderer
 
 from ....conftest import ImageTestAssets
 from ...utils import build_model_context
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    "model_id",
+    ["Qwen/Qwen2-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"],
+)
+def test_gpu_video_preprocessing_keeps_output_on_cuda(model_id: str):
+    ctx = build_model_context(
+        model_id,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+    frames = torch.zeros((4, 64, 64, 3), dtype=torch.uint8, device="cuda")
+    metadata = {
+        "fps": 2.0,
+        "duration": 2.0,
+        "total_num_frames": 4,
+        "frames_indices": [0, 1, 2, 3],
+        "video_backend": "pynvvideocodec",
+        "do_sample_frames": False,
+    }
+
+    processed = processor(
+        "<|vision_start|><|video_pad|><|vision_end|>",
+        mm_items=processor.info.parse_mm_data(
+            {"video": [(GPUVideoFrames(frames), metadata)]}
+        ),
+        mm_uuid_items={"video": ["gpu-video"]},
+    )
+    video_inputs = processed["mm_kwargs"].get_data()
+
+    assert processor.info.supports_gpu_video_preprocessing
+    assert video_inputs["pixel_values_videos"].is_cuda
+    assert not video_inputs["video_grid_thw"].is_cuda
+    assert BaseRenderer._collect_cuda_tensors(processed["mm_kwargs"])
+    assert len(processed["mm_placeholders"]["video"]) == 1
 
 
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen2-VL-2B-Instruct"])

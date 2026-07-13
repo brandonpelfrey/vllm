@@ -829,6 +829,10 @@ class Qwen2VLMultiModalDataParser(MultiModalDataParser):
 
 
 class Qwen2VLProcessingInfo(BaseProcessingInfo):
+    @property
+    def supports_gpu_video_preprocessing(self) -> bool:
+        return True
+
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen2VLConfig)
 

@@ -5770,8 +5770,11 @@ class GPUModelRunner(
         metadata.setdefault("duration", 1.0 / max(float(metadata["fps"]), 1.0))
         metadata["frames_indices"] = [0]
         metadata["video_backend"] = "gpu_video_preprocessing_profile"
+        profile_video_item = (
+            (fake_video, metadata) if isinstance(video_item, tuple) else fake_video
+        )
         processor_inputs.mm_data_items["video"] = VideoProcessorItems(
-            [(fake_video, metadata)],
+            [profile_video_item],
             metadata=[metadata],
         )
         processor_inputs.mm_uuid_items = {"video": ["gpu-video-profile"]}

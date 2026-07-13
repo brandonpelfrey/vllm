@@ -38,6 +38,7 @@ from vllm.multimodal.gpu_ipc_memory import (
     get_mm_gpu_ipc_pool,
     maybe_init_mm_gpu_ipc_pool,
 )
+from vllm.multimodal.inputs import MultiModalFieldElem
 from vllm.multimodal.parse import (
     MultiModalDataItems,
     MultiModalUUIDItems,
@@ -755,6 +756,8 @@ class BaseRenderer(ABC, Generic[_T]):
     @staticmethod
     def _collect_cuda_tensors(data: object) -> list[torch.Tensor]:
         tensors: list[torch.Tensor] = []
+        if isinstance(data, MultiModalFieldElem):
+            return BaseRenderer._collect_cuda_tensors(data.data)
         if isinstance(data, torch.Tensor):
             if data.is_cuda:
                 tensors.append(data)

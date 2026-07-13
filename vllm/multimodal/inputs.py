@@ -287,6 +287,12 @@ def _nested_tensors_h2d(
     )
 
 
+def _nested_tensors_are_cpu(tensors: NestedTensors) -> bool:
+    if isinstance(tensors, torch.Tensor):
+        return tensors.device.type == "cpu"
+    return all(_nested_tensors_are_cpu(item) for item in tensors)
+
+
 BatchedTensorInputs: TypeAlias = dict[str, NestedTensors]
 """
 A dictionary containing nested tensors which have been batched via
@@ -460,6 +466,8 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
+        if pin_memory and not all(_nested_tensors_are_cpu(item) for item in batch):
+            pin_memory = False
         out = self._reduce_data(batch, pin_memory=pin_memory)
         return _nested_tensors_h2d(out, device=device)
 

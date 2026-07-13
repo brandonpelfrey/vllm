@@ -6,11 +6,24 @@ import torch
 from vllm.multimodal.inputs import (
     MultiModalBatchedField,
     MultiModalFieldElem,
+    MultiModalFlatField,
     MultiModalKwargsItem,
     MultiModalSharedField,
     PlaceholderRange,
 )
 from vllm.multimodal.utils import argsort_mm_positions, group_and_batch_mm_items
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_flat_field_does_not_pin_cuda_tensor():
+    tensor = torch.zeros((2, 4), device="cuda")
+    field = MultiModalFlatField(slices=[slice(0, 2)])
+    elem = MultiModalFieldElem(data=tensor, field=field)
+
+    output = field.reduce_data([elem], device="cuda", pin_memory=True)
+
+    assert output.is_cuda
+    assert output.data_ptr() == tensor.data_ptr()
 
 
 @pytest.mark.parametrize(

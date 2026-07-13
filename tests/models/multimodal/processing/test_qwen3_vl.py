@@ -10,12 +10,48 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.gpu_ipc_memory import GPUVideoFrames
+from vllm.renderers.base import BaseRenderer
 
 from ...utils import build_model_context
 
 MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_gpu_video_preprocessing_keeps_output_on_cuda() -> None:
+    ctx = build_model_context(
+        MODEL_ID,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+    frames = torch.zeros((4, 64, 64, 3), dtype=torch.uint8, device="cuda")
+    metadata = {
+        "fps": 2.0,
+        "duration": 2.0,
+        "total_num_frames": 4,
+        "frames_indices": [0, 1, 2, 3],
+        "video_backend": "pynvvideocodec",
+        "do_sample_frames": False,
+    }
+
+    processed = processor(
+        "<|vision_start|><|video_pad|><|vision_end|>",
+        mm_items=processor.info.parse_mm_data(
+            {"video": [(GPUVideoFrames(frames), metadata)]}
+        ),
+        mm_uuid_items={"video": ["gpu-video"]},
+    )
+    video_inputs = processed["mm_kwargs"].get_data()
+
+    assert processor.info.supports_gpu_video_preprocessing
+    assert video_inputs["pixel_values_videos"].is_cuda
+    assert not video_inputs["video_grid_thw"].is_cuda
+    assert BaseRenderer._collect_cuda_tensors(processed["mm_kwargs"])
+    assert len(processed["mm_placeholders"]["video"]) == 1
 
 
 def _build_video_mm_data(
