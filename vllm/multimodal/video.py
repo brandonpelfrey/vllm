@@ -216,7 +216,11 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Fixed upper bound reserved for persistent PyNvVideoCodec decoder surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
-PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 1
+# Env-configurable (VLLM_PYNVC_MAX_CONCURRENT_DECODERS, default 1): measured
+# on H100 + Qwen3-VL-2B synthetic video (720p/5s, C=200), lanes=2 lifts
+# ingest throughput ~+16-19% over serialize-to-1 with NVDEC util 39%->79%
+# peak and no err-801 recurrence.
+PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = envs.VLLM_PYNVC_MAX_CONCURRENT_DECODERS
 # Per-API-server CUDA context and driver allocation, measured with
 # PyNvVideoCodec 2.0.4 on H100.
 PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES = int(1.8 * 1024 * MiB_bytes)
