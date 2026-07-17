@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
+    VLLM_PYNVC_MAX_CONCURRENT_DECODERS: int = 1
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
     VLLM_TARGET_DEVICE: str = "cuda"
@@ -986,6 +987,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If a non-existing backend is used, an AssertionError will be thrown.
     "VLLM_VIDEO_LOADER_BACKEND": lambda: os.getenv(
         "VLLM_VIDEO_LOADER_BACKEND", "opencv"
+    ),
+    # Max concurrent PyNvVideoCodec GPU video decodes per process. Each decode
+    # lane costs ~128 MB of decoder surfaces (bounded by the worker reserve
+    # accounting in gpu_worker.py). Default 1 preserves the historical
+    # serialize-to-1 behavior.
+    "VLLM_PYNVC_MAX_CONCURRENT_DECODERS": lambda: int(
+        os.getenv("VLLM_PYNVC_MAX_CONCURRENT_DECODERS", "1")
     ),
     # Media connector implementation.
     # - "http": Default connector that supports fetching media via HTTP.

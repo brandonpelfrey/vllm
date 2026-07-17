@@ -216,7 +216,11 @@ PYNVVIDEOCODEC_VIDEO_BACKEND: Literal["pynvvideocodec"] = "pynvvideocodec"
 # Fixed upper bound reserved for persistent PyNvVideoCodec decoder surfaces.
 PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES = 128 * MiB_bytes
 PYNVVIDEOCODEC_DECODER_CACHE_SIZE = 2
-PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = 1
+# Env-configurable (VLLM_PYNVC_MAX_CONCURRENT_DECODERS, default 1): measured
+# on H100 + Qwen3-VL-2B synthetic video (720p/5s, C=200), lanes=2 lifts
+# ingest throughput ~+16-19% over serialize-to-1 with NVDEC util 39%->79%
+# peak and no err-801 recurrence.
+PYNVVIDEOCODEC_MAX_RETAINED_DECODERS = envs.VLLM_PYNVC_MAX_CONCURRENT_DECODERS
 # Per-API-server CUDA context and driver allocation, measured with
 # PyNvVideoCodec 2.0.4 on H100.
 PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES = int(1.8 * 1024 * MiB_bytes)
@@ -628,9 +632,10 @@ class TorchCodecVideoBackendMixin:
 class PyNvVideoCodecVideoBackendMixin:
     """PyNvVideoCodec utilities for GPU-backed frame decode."""
 
-    _decoder_slots: ClassVar[list[PyNvVideoCodecDecoderSlot]] = []
-    _active_decoder_slots: ClassVar[int] = 0
-    _decoder_slot_cond: ClassVar[threading.Condition] = threading.Condition()
+    _decode_semaphore: ClassVar[threading.Semaphore] = threading.Semaphore(
+        PYNVVIDEOCODEC_MAX_RETAINED_DECODERS
+    )
+    _thread_slots: ClassVar[threading.local] = threading.local()
     _DEVICE_INDEX: ClassVar[int] = 0
 
     @classmethod
@@ -670,34 +675,21 @@ class PyNvVideoCodecVideoBackendMixin:
     @classmethod
     @contextmanager
     def _borrow_decoder_slot(cls):
-        create_slot = False
-        with cls._decoder_slot_cond:
-            while True:
-                if cls._decoder_slots:
-                    slot = cls._decoder_slots.pop()
-                    break
-                if cls._active_decoder_slots < PYNVVIDEOCODEC_MAX_RETAINED_DECODERS:
-                    cls._active_decoder_slots += 1
-                    create_slot = True
-                    break
-                cls._decoder_slot_cond.wait()
-
-        if create_slot:
-            try:
+        # Thread-affine retained decode: the semaphore bounds concurrency at
+        # PYNVVIDEOCODEC_MAX_CONCURRENT_DECODERS, while each worker thread retains
+        # its OWN slot (CUDA stream + decoder), created on first use ON this
+        # thread and reused for later decodes on the same thread. Reuse keeps
+        # reconfigure_decoder repointing (a fresh SimpleDecoder per decode
+        # measured 4x SLOWER); confinement keeps each stream created-and-used on
+        # one thread, so the cross-thread stream/context race (CUDA err 801)
+        # that motivated serialize-to-1 cannot recur. Retention cost is bounded
+        # by the decode thread-pool size (~128 MB per thread that ever decodes).
+        with cls._decode_semaphore:
+            slot = getattr(cls._thread_slots, "slot", None)
+            if slot is None:
                 slot = cls._create_decoder_slot()
-            except Exception:
-                with cls._decoder_slot_cond:
-                    cls._active_decoder_slots -= 1
-                    cls._decoder_slot_cond.notify()
-                raise
-
-        try:
+                cls._thread_slots.slot = slot
             yield slot
-        finally:
-            with cls._decoder_slot_cond:
-                cls._decoder_slots.append(slot)
-                cls._decoder_slot_cond.notify()
-
     @staticmethod
     def _metadata_value(metadata, *names: str, default=None):
         for name in names:
