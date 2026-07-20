@@ -3,16 +3,133 @@
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
+import vllm.multimodal.gpu_ipc_memory as gpu_ipc_memory_module
 from vllm.multimodal.gpu_ipc_memory import (
     MultiModalGPUMemoryPool,
     get_mm_gpu_ipc_pool,
+    get_mm_gpu_memory_reservation_bytes,
     maybe_init_mm_gpu_ipc_pool,
     set_mm_gpu_ipc_pool,
 )
+from vllm.multimodal.video import (
+    PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
+    PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
+    PYNVVIDEOCODEC_DEFAULT_HW_DECODERS,
+    PYNVVIDEOCODEC_VIDEO_BACKEND,
+)
 from vllm.utils.mem_constants import GiB_bytes
+
+
+def _mm_config(
+    *,
+    mm_ipc_gpu_memory_gb: float = 0,
+    video_backend: str | None = None,
+    hw_decoders: int | None = None,
+):
+    video_kwargs: dict[str, object] = (
+        {} if video_backend is None else {"video_backend": video_backend}
+    )
+    if hw_decoders is not None:
+        video_kwargs["hw_decoders"] = hw_decoders
+
+    return SimpleNamespace(
+        mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,
+        media_io_kwargs={"video": video_kwargs} if video_kwargs else {},
+    )
+
+
+def _pynvvideocodec_decoder_budget(
+    api_process_count: int = 1,
+    hw_decoders: int = PYNVVIDEOCODEC_DEFAULT_HW_DECODERS,
+) -> int:
+    return api_process_count * (
+        PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES * hw_decoders
+        + PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES
+    )
+
+
+@pytest.mark.parametrize("video_backend", [None, "opencv"])
+def test_gpu_memory_reservation_raw_frame_budget_only(
+    monkeypatch: pytest.MonkeyPatch,
+    video_backend: str | None,
+):
+    monkeypatch.setattr(
+        gpu_ipc_memory_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        "opencv",
+    )
+    mm_config = _mm_config(mm_ipc_gpu_memory_gb=0.25, video_backend=video_backend)
+
+    assert get_mm_gpu_memory_reservation_bytes(mm_config) == int(0.25 * GiB_bytes)
+
+
+def test_gpu_memory_reservation_includes_pynvvideocodec_decoder_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_ipc_memory_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        "opencv",
+    )
+    mm_config = _mm_config(
+        mm_ipc_gpu_memory_gb=0.25,
+        video_backend=PYNVVIDEOCODEC_VIDEO_BACKEND,
+    )
+
+    assert get_mm_gpu_memory_reservation_bytes(mm_config) == (
+        int(0.25 * GiB_bytes) + _pynvvideocodec_decoder_budget()
+    )
+
+
+def test_gpu_memory_reservation_uses_env_video_backend(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_ipc_memory_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        PYNVVIDEOCODEC_VIDEO_BACKEND,
+    )
+
+    assert (
+        get_mm_gpu_memory_reservation_bytes(_mm_config())
+        == _pynvvideocodec_decoder_budget()
+    )
+
+
+def test_gpu_memory_reservation_scales_decoder_budget_by_api_processes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_ipc_memory_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        PYNVVIDEOCODEC_VIDEO_BACKEND,
+    )
+
+    assert get_mm_gpu_memory_reservation_bytes(
+        _mm_config(), api_process_count=3
+    ) == _pynvvideocodec_decoder_budget(api_process_count=3)
+
+
+def test_gpu_memory_reservation_uses_configured_hw_decoders(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        gpu_ipc_memory_module.envs,
+        "VLLM_VIDEO_LOADER_BACKEND",
+        "opencv",
+    )
+    mm_config = _mm_config(
+        video_backend=PYNVVIDEOCODEC_VIDEO_BACKEND,
+        hw_decoders=3,
+    )
+
+    assert get_mm_gpu_memory_reservation_bytes(
+        mm_config
+    ) == _pynvvideocodec_decoder_budget(hw_decoders=3)
 
 
 def test_acquire_release_accounting():
