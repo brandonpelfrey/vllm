@@ -17,11 +17,64 @@ amount out of its KV-cache budget so the headroom physically exists.
 """
 
 import threading
+from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.logger import init_logger
+from vllm.multimodal.video import (
+    PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
+    PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
+    PYNVVIDEOCODEC_DEFAULT_HW_DECODERS,
+    PYNVVIDEOCODEC_VIDEO_BACKEND,
+    VIDEO_LOADER_REGISTRY,
+    validate_pynvvideocodec_hw_decoders,
+)
 from vllm.utils.mem_constants import GiB_bytes
 
+if TYPE_CHECKING:
+    from vllm.config.multimodal import MultiModalConfig
+
 logger = init_logger(__name__)
+
+
+def get_mm_gpu_memory_reservation_bytes(
+    mm_config: "MultiModalConfig | None",
+    api_process_count: int = 1,
+) -> int:
+    """Return GPU memory reserved for frontend multimodal processing."""
+    if mm_config is None:
+        return 0
+
+    reserved_bytes = int(mm_config.mm_ipc_gpu_memory_gb * GiB_bytes)
+    video_kwargs = mm_config.media_io_kwargs.get("video", {})
+    video_loader_backend = (
+        video_kwargs.get("video_backend") or envs.VLLM_VIDEO_LOADER_BACKEND
+    )
+    codec_backend = video_kwargs.get("backend")
+    uses_gpu_video_backend = VIDEO_LOADER_REGISTRY.backend_requires_gpu(
+        video_loader_backend
+    ) or (
+        codec_backend is not None
+        and VIDEO_LOADER_REGISTRY.backend_requires_gpu(codec_backend)
+    )
+    if not uses_gpu_video_backend:
+        return reserved_bytes
+
+    hw_decoders = PYNVVIDEOCODEC_DEFAULT_HW_DECODERS
+    if (
+        video_loader_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
+        or codec_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
+    ):
+        hw_decoders = validate_pynvvideocodec_hw_decoders(
+            video_kwargs.get("hw_decoders", PYNVVIDEOCODEC_DEFAULT_HW_DECODERS)
+        )
+
+    # Decoder surfaces and their CUDA context are local to each API process.
+    per_process_decoder_bytes = (
+        PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES * hw_decoders
+        + PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES
+    )
+    return reserved_bytes + max(1, api_process_count) * per_process_decoder_bytes
 
 
 class MultiModalGPUMemoryLease:
