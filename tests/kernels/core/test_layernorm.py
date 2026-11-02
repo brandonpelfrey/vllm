@@ -28,6 +28,53 @@ CUDA_DEVICES = [
 ]
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="RADIO CUDA kernel")
+@pytest.mark.parametrize("num_tokens", [1, 7, 257, 1034, 4097, 13234])
+@pytest.mark.parametrize("scale", [0.01, 1.0, 100.0])
+@torch.inference_mode()
+def test_radio_residual_layer_norm_matches_bf16_rounding(num_tokens, scale):
+    """Fusion preserves the BF16 residual and native LayerNorm reduction order."""
+    from vllm.model_executor.layers import radio_layernorm
+
+    if (
+        torch.cuda.get_device_capability()
+        not in radio_layernorm._QUALIFIED_CAPABILITIES
+    ):
+        pytest.skip("Unqualified CUDA architecture")
+    if not torch.__version__.startswith(radio_layernorm._QUALIFIED_TORCH):
+        pytest.skip("PyTorch LayerNorm reduction order is version-specific")
+    assert hasattr(torch.ops._C, "radio_fused_residual_layer_norm")
+    torch.manual_seed(42)
+    residual = (
+        torch.randn(num_tokens, 1280, device="cuda", dtype=torch.bfloat16) * scale
+    )
+    update = torch.randn_like(residual) * scale
+    norm = torch.nn.LayerNorm(1280, eps=1e-6, device="cuda", dtype=torch.bfloat16)
+    norm.weight.normal_(mean=1.0, std=0.1)
+    norm.bias.normal_(std=0.1)
+    expected_sum = residual + update
+    expected_norm = norm(expected_sum)
+    actual_sum, actual_norm = radio_layernorm.fused_residual_layer_norm(
+        residual, update, norm
+    )
+    torch.testing.assert_close(actual_sum, expected_sum, rtol=0, atol=0)
+    torch.testing.assert_close(actual_norm, expected_norm, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("width", [8, 1280])
+def test_radio_residual_layer_norm_cpu_fallback_preserves_autograd(width):
+    from vllm.model_executor.layers.radio_layernorm import fused_residual_layer_norm
+
+    residual = torch.randn(3, width, requires_grad=True)
+    update = torch.randn_like(residual)
+    norm = torch.nn.LayerNorm(width)
+    summed, normalized = fused_residual_layer_norm(residual, update, norm)
+    torch.testing.assert_close(summed, residual + update, rtol=0, atol=0)
+    torch.testing.assert_close(normalized, norm(residual + update), rtol=0, atol=0)
+    normalized.square().sum().backward()
+    assert residual.grad is not None
+
+
 def _rms_norm_tolerance(dtype: torch.dtype) -> dict[str, float]:
     return ir.ops.rms_norm.get_tolerance(dtype)
 

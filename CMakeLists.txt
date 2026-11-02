@@ -481,6 +481,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/fused_qknorm_rope_cache_kernel.cu")
   endif()
 
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND VLLM_STABLE_EXT_SRC "csrc/radio_layernorm.cu")
+    # Keep IEEE division and square root so results match PyTorch's LayerNorm.
+    set_source_files_properties("csrc/radio_layernorm.cu"
+      PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true")
+  endif()
+
   if(VLLM_GPU_LANG STREQUAL "CUDA" AND
      DEFINED CMAKE_CUDA_COMPILER_VERSION AND
      CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)

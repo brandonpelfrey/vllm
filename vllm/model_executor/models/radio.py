@@ -469,8 +469,18 @@ class RadioLayerScale(nn.Module):
         self.lambda1 = nn.Parameter(
             config.layerscale_value * torch.ones(config.hidden_size)
         )
+        # Opt-in: skip the multiplication once the loaded scale is exactly one.
+        self.skip_identity = getattr(
+            config, "radio_encoder_skip_identity_scales", False
+        )
+        self.is_identity = False
+
+    def refresh_identity(self) -> None:
+        self.is_identity = self.skip_identity and bool(torch.all(self.lambda1 == 1))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.is_identity:
+            return hidden_states
         return hidden_states * self.lambda1
 
 
@@ -552,6 +562,30 @@ class RadioVisionEncoder(nn.Module):
                 for layer_idx in range(num_hidden_layers)
             ]
         )
+        self.fused_residual_norm = getattr(
+            config, "radio_encoder_fused_residual_norm", False
+        )
+        self.graph_runner = None
+        if getattr(config, "radio_encoder_cudagraph", False):
+            from .radio_cudagraph import RadioEncoderCudaGraphRunner
+
+            self.graph_runner = RadioEncoderCudaGraphRunner(
+                getattr(config, "radio_encoder_cudagraph_max_tokens", 2048),
+                getattr(config, "radio_encoder_cudagraph_cache_size", 4),
+            )
+
+    def _apply(self, fn, recurse=True):
+        if self.graph_runner is not None:
+            self.graph_runner.clear()
+        return super()._apply(fn, recurse)
+
+    def refresh_runtime_state(self) -> None:
+        """Drop captured graphs and re-check layer scales after loading weights."""
+        if self.graph_runner is not None:
+            self.graph_runner.clear()
+        for encoder_layer in self.layer:
+            encoder_layer.layer_scale1.refresh_identity()
+            encoder_layer.layer_scale2.refresh_identity()
 
     def forward(
         self,
@@ -560,13 +594,56 @@ class RadioVisionEncoder(nn.Module):
     ):
         # Metadata implies a packed batch, and the compiled graph bakes that dim 0 == 1.
         assert mask_meta is None or inputs_embeds.shape[0] == 1
-        hidden_states = inputs_embeds
+        # Graphs cover single sequences only: unmasked, or one image's [0, n].
+        if self.graph_runner is not None and (
+            mask_meta is None or mask_meta.cu_seqlens.numel() == 2
+        ):
+            return self.graph_runner(self._forward_layers, inputs_embeds, mask_meta)
+        return self._forward_layers(inputs_embeds, mask_meta)
+
+    def _forward_layers(
+        self, hidden_states: torch.Tensor, mask_meta: MaskMetadata | None
+    ) -> torch.Tensor:
         cu_seqlens = mask_meta.cu_seqlens if mask_meta is not None else None
         max_seqlen = mask_meta.max_seqlen if mask_meta is not None else None
+        # The fused path calls the layers' parts directly, bypassing compiled layers.
+        if self.fused_residual_norm and self.layer and self.layer[0].do_not_compile:
+            return self._forward_fused_layers(hidden_states, cu_seqlens, max_seqlen)
         for encoder_layer in self.layer:
             hidden_states = encoder_layer(
                 hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
             )
+        return hidden_states
+
+    def _forward_fused_layers(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        max_seqlen: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """:meth:`RadioLayer.forward` for every layer, with each residual addition
+        fused into the LayerNorm that follows it (the next ``norm2`` or ``norm1``)."""
+        from vllm.model_executor.layers.radio_layernorm import (
+            fused_residual_layer_norm,
+        )
+
+        normalized = self.layer[0].norm1(hidden_states)
+        for index, layer in enumerate(self.layer):
+            attn_out = layer.attention(
+                normalized, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+            )
+            hidden_states, normalized = fused_residual_layer_norm(
+                hidden_states,
+                layer.drop_path(layer.layer_scale1(attn_out)),
+                layer.norm2,
+            )
+            mlp_out = layer.drop_path(layer.layer_scale2(layer.mlp(normalized)))
+            if index + 1 < len(self.layer):
+                hidden_states, normalized = fused_residual_layer_norm(
+                    hidden_states, mlp_out, self.layer[index + 1].norm1
+                )
+            else:
+                hidden_states = mlp_out + hidden_states
         return hidden_states
 
 
@@ -728,6 +805,7 @@ class RadioModel(nn.Module):
         weights = ((name, w) for name, w in weights if name.startswith(prefixes))
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self.encoder.refresh_runtime_state()
         if not loaded:
             logger.warning(
                 "RadioModel.load_weights matched no checkpoint tensors; the "

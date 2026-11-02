@@ -1750,6 +1750,16 @@ class NemotronH_Nano_VL_V2(
             separate_video_embedder=separate_video_embedder,
             **hf_config_vision.args,
         )
+        # Opt-in encoder runtime options, set through --hf-overrides.
+        for name in (
+            "radio_encoder_cudagraph",
+            "radio_encoder_cudagraph_max_tokens",
+            "radio_encoder_cudagraph_cache_size",
+            "radio_encoder_skip_identity_scales",
+            "radio_encoder_fused_residual_norm",
+        ):
+            if hasattr(hf_config, name):
+                setattr(radio_config, name, getattr(hf_config, name))
 
         return RadioModel(config=radio_config)
 

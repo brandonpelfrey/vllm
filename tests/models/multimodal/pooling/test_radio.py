@@ -12,7 +12,11 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModel, CLIPImageProcessor
 
 from vllm.distributed import cleanup_dist_env_and_memory
-from vllm.model_executor.models.radio import RadioModel
+from vllm.model_executor.models.radio import (
+    MaskMetadata,
+    RadioLayerScale,
+    RadioModel,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.transformers_utils.repo_utils import hf_api
@@ -304,3 +308,70 @@ def test_native_format_from_transformers(default_vllm_config, dist_init):
         else:
             continue
         assert torch.equal(param, ref), f"value mismatch after native load: {name}"
+
+
+@pytest.mark.parametrize("value", [1.0, 0.75, 0.0])
+@pytest.mark.parametrize("skip", [False, True])
+def test_layer_scale_skip_preserves_nonunit_scales(value, skip):
+    """Skipping exactly-one scales must not bypass trained LayerScale values."""
+    config = RadioConfig(model_name="vit_huge_patch16_224")
+    config.radio_encoder_skip_identity_scales = skip
+    layer_scale = RadioLayerScale(config)
+    with torch.no_grad():
+        layer_scale.lambda1.fill_(value)
+    layer_scale.refresh_identity()
+    assert layer_scale.is_identity == (skip and value == 1.0)
+    x = torch.randn(2, 4, config.hidden_size)
+    torch.testing.assert_close(layer_scale(x), x * layer_scale.lambda1, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph test")
+@pytest.mark.parametrize("masked", [False, True])
+@torch.inference_mode()
+def test_radio_graph_replay_uses_new_inputs_and_owns_outputs(dist_init, masked):
+    """A replay cannot reuse previous image features or overwrite retained output."""
+    from vllm.model_executor.models.radio_cudagraph import RadioEncoderCudaGraphRunner
+
+    runner = RadioEncoderCudaGraphRunner(max_tokens=8, max_graphs=1)
+    weights = torch.randn(8, 8, device="cuda")
+
+    def single_sequence(x):
+        if not masked:
+            return None
+        cu_seqlens = torch.tensor([0, x.shape[1]], dtype=torch.int32, device="cuda")
+        return MaskMetadata(cu_seqlens=cu_seqlens, max_seqlen=torch.tensor(x.shape[1]))
+
+    def expected(x):
+        # The masked forward reads cu_seqlens on the device, like the attention does.
+        return x @ weights + (x.shape[1] if masked else 0)
+
+    def forward(x, mask_meta):
+        assert (mask_meta is not None) == masked
+        if mask_meta is None:
+            return x @ weights
+        assert mask_meta.cu_seqlens.numel() == 2
+        return x @ weights + mask_meta.cu_seqlens[1].to(x.dtype)
+
+    x = torch.randn(1, 4, 8, device="cuda")
+    y = torch.randn_like(x)
+    first = runner(forward, x, single_sequence(x))
+    retained = first.clone()
+    # Reuse any memory the capture freed; the replay must not read from it.
+    clobber = [
+        torch.full((2,), 1000, dtype=torch.int32, device="cuda") for _ in range(64)
+    ]
+    second = runner(forward, y, single_sequence(y))
+    del clobber
+    torch.testing.assert_close(first, retained, rtol=0, atol=0)
+    torch.testing.assert_close(first, expected(x), rtol=0, atol=0)
+    torch.testing.assert_close(second, expected(y), rtol=0, atol=0)
+    assert len(runner.graphs) == 1
+    for tokens in (5, 9):
+        other_shape = torch.randn(1, tokens, 8, device="cuda")
+        torch.testing.assert_close(
+            runner(forward, other_shape, single_sequence(other_shape)),
+            expected(other_shape),
+        )
+    assert len(runner.graphs) == 1
+    runner.clear()
+    assert not runner.graphs
